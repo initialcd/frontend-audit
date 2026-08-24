@@ -1,0 +1,11 @@
+# 冒烟测试配置：本地 http.server + 纯正则模式（不调用 LLM）
+scan:
+  concurrency: 8
+  per_domain_qps: 50
+  max_depth: 3
+  llm_enabled: false
+scope:
+  domains: ["127.0.0.1"]
+storage:
+  db_path: "state-smoke.db"
+  output_dir: "reports-smoke"

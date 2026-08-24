@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.tmp/
+.pytest_cache/
+pytest-cache-files-*/
+state*.db
+reports/
+reports-smoke/
+reports-ui/
+config.yaml

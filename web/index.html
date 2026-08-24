@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>前端代码审计</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<header>
+  <h1>前端代码审计 · 敏感信息 & API 递归发现 by inicd</h1>
+  <div class="badges">
+    <span id="badge-llm" class="badge off">DeepSeek: 检测中</span>
+    <span id="badge-proxy" class="badge off">代理: 关</span>
+  </div>
+</header>
+
+<div class="layout">
+  <!-- 左：表单 -->
+  <div class="panel">
+    <div class="panel-body">
+      <div class="form-row">
+        <label>授权扫描清单（每行一个 URL）</label>
+        <textarea id="seeds" placeholder="https://target.example.com&#10;https://app.example.com/index.html"></textarea>
+        <div class="hint">只允许 http/https；递归永远出不了下方白名单</div>
+      </div>
+
+      <div class="form-row">
+        <label>授权域名白名单（逗号分隔）</label>
+        <div class="row2">
+          <input type="text" id="domains" placeholder="example.com,a.example.com">
+          <button id="extract-domains" class="ghost" type="button">从种子提取</button>
+        </div>
+        <div class="hint">默认包含子域；未填则拒绝运行（安全约束）</div>
+      </div>
+
+      <div class="form-row row2">
+        <div>
+          <label>递归深度</label>
+          <input type="number" id="depth" value="5" min="0" max="6">
+        </div>
+        <div>
+          <label>并发</label>
+          <input type="number" id="concurrency" value="20" min="1" max="100">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label>每域 QPS（防封 IP）</label>
+        <input type="number" id="qps" value="5" min="0" step="0.5">
+      </div>
+
+      <div class="form-row">
+        <div class="check">
+          <input type="checkbox" id="llm">
+          <label for="llm" style="margin:0">启用 DeepSeek 审计（关闭则纯本地正则）</label>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="check">
+          <input type="checkbox" id="proxy">
+          <label for="proxy" style="margin:0">启用代理池（走 config.yaml 中配置的代理）</label>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>增强渲染模式（需安装 Playwright）</label>
+        <select id="render_mode">
+          <option value="hybrid">hybrid — 仅对 SPA 空壳启用（推荐，平衡速度与覆盖率）</option>
+          <option value="full">full — 对所有页面启用（覆盖率最高，速度较慢）</option>
+          <option value="off">off — 关闭渲染，纯 httpx 模式</option>
+        </select>
+      </div>
+
+      <div class="btn-row">
+        <button id="start" class="primary" type="button">开始扫描</button>
+        <button id="cancel" class="ghost" type="button" style="display:none">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右：进度/结果 -->
+  <div class="panel main">
+    <div class="tabs">
+      <button class="tab active" data-tab="progress">进度</button>
+      <button class="tab" data-tab="findings">发现</button>
+      <button class="tab" data-tab="endpoints">接口</button>
+      <button class="tab" data-tab="nodes">节点</button>
+    </div>
+    <div class="tab-content">
+      <!-- 进度 -->
+      <div id="tab-progress" class="tab-pane active">
+        <div class="metrics">
+          <div class="metric"><div class="k">抓取节点</div><div class="v" id="m-nodes">0</div></div>
+          <div class="metric"><div class="k">HTML / JS / JSON</div><div class="v" id="m-kinds">0/0/0</div></div>
+          <div class="metric"><div class="k">审计发现</div><div class="v" id="m-findings">0</div></div>
+          <div class="metric"><div class="k">接口探测</div><div class="v" id="m-endpoints">0</div></div>
+          <div class="metric"><div class="k">LLM 调用</div><div class="v" id="m-llm">0</div></div>
+          <div class="metric"><div class="k">跳过(域/重/预算)</div><div class="v" id="m-skip">0/0/0</div></div>
+          <div class="metric"><div class="k">状态</div><div class="v" id="m-status" style="font-size:14px">空闲</div></div>
+          <div class="metric"><div class="k">耗时</div><div class="v" id="m-elapsed" style="font-size:16px">0s</div></div>
+        </div>
+        <div id="log"></div>
+      </div>
+
+      <!-- 发现 -->
+      <div id="tab-findings" class="tab-pane">
+        <div class="dl-row">
+          <button class="ghost" onclick="dl('md')">下载 report.md</button>
+          <button class="ghost" onclick="dl('json')">下载 full.json</button>
+        </div>
+        <table>
+          <thead><tr><th>级别</th><th>类型</th><th>值</th><th>来源</th><th>置信度</th><th>理由</th></tr></thead>
+          <tbody id="tb-findings"></tbody>
+        </table>
+      </div>
+
+      <!-- 接口 -->
+      <div id="tab-endpoints" class="tab-pane">
+        <table>
+          <thead><tr><th>接口</th><th>GET</th><th>OPTIONS</th><th>POST</th><th>CORS</th></tr></thead>
+          <tbody id="tb-endpoints"></tbody>
+        </table>
+      </div>
+
+      <!-- 节点 -->
+      <div id="tab-nodes" class="tab-pane">
+        <table>
+          <thead><tr><th>URL</th><th>状态</th><th>类型</th><th>大小</th><th>深度</th></tr></thead>
+          <tbody id="tb-nodes"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/web/app.js"></script>
+</body>
+</html>
