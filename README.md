@@ -269,3 +269,11 @@ python -m playwright install chromium
 ```
 
 整个过程全自动，你只需要提供 URL 和域名白名单，等报告出来就行。如果追求最高覆盖率，建议安装 Playwright 并将 `render_mode` 设为 `full`。
+
+
+
+## 九、使用方法
+
+```
+在config.yaml文件中配置大模型的id和key，然后使用命令行python ./web.py 即可打开web ui界面
+```
