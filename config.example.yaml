@@ -1,0 +1,93 @@
+# ============================================================
+# 前端代码审计工具 - 配置模板
+# 使用方法: 复制本文件为 config.yaml，填入你的配置
+#           cp config.example.yaml config.yaml
+# ============================================================
+
+deepseek:
+  api_key: ""                    # DeepSeek API Key（或设置环境变量 DEEPSEEK_API_KEY）
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+  temperature: 0
+  max_tokens: 4096
+
+scan:
+  concurrency: 20                # 全局异步并发
+  per_domain_qps: 5              # 每域每秒请求上限（防封 IP）
+  timeout: 15                    # 单请求超时（秒）
+  retries: 2                     # 失败重试次数
+  max_depth: 5                   # 递归深度上限（种子为 0）
+  max_nodes_per_domain: 2000     # 每域节点上限
+  max_total_nodes: 10000         # 全局节点上限
+  max_method_probes: 3000        # OPTIONS/POST 探测总次数上限
+  max_asset_kb: 2048             # 超过该大小的响应只记录不下载
+  snippet_context: 100           # 正则命中前后各取多少字符送 LLM
+  llm_snippet_cap: 12000         # 每次送 LLM 的片段总字符上限
+  llm_enabled: true              # 关掉则纯本地正则模式（--no-llm 同效）
+  verify_tls: true
+  render_enabled: true           # 启用 Playwright 渲染（需装 playwright）
+  render_mode: "hybrid"          # off=纯httpx / hybrid=仅SPA空壳启用 / full=全部HTML启用
+  render_max_clicks: 30          # 渲染时最多点击多少个元素触发懒加载
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  allowed_content_types:
+    - "text/html"
+    - "application/xhtml+xml"
+    - "application/javascript"
+    - "text/javascript"
+    - "application/x-javascript"
+    - "text/ecmascript"
+    - "application/json"
+    - "text/json"
+    - "text/plain"
+    - "application/octet-stream"
+  excluded_extensions:
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".gif"
+    - ".webp"
+    - ".ico"
+    - ".svg"
+    - ".woff"
+    - ".woff2"
+    - ".ttf"
+    - ".eot"
+    - ".otf"
+    - ".mp4"
+    - ".mp3"
+    - ".webm"
+    - ".zip"
+    - ".gz"
+    - ".tar"
+    - ".pdf"
+    - ".doc"
+    - ".xls"
+
+scope:
+  domains: []                    # 【必填】授权域名白名单，如 ["example.com"]
+  allow_subdomains: true
+
+proxy:
+  enabled: false
+  mode: "local"                  # local | api
+  local_url: "http://127.0.0.1:8080"
+  api_url: ""
+  api_key: ""
+  refresh_seconds: 300
+
+methods:
+  probe: ["OPTIONS", "POST"]
+  dangerous_patterns:
+    - "delete"
+    - "remove"
+    - "upload"
+    - "pay"
+    - "order"
+    - "reset"
+    - "transfer"
+    - "logout"
+    - "deactivate"
+
+storage:
+  db_path: "state.db"
+  output_dir: "reports"
