@@ -7,7 +7,7 @@
 deepseek:
   api_key: ""                    # DeepSeek API Key（或设置环境变量 DEEPSEEK_API_KEY）
   base_url: "https://api.deepseek.com"
-  model: "deepseek-chat"
+  model: "deepseek-v4-flash"    # deepseek-v4-flash（快速）/ deepseek-v4-pro（推理强）
   temperature: 0
   max_tokens: 4096
 

@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 class DeepSeekConfig(BaseModel):
     api_key: str = ""
     base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-chat"
+    model: str = "deepseek-v4-flash"
     temperature: float = 0.0
     max_tokens: int = 4096
 
