@@ -8,7 +8,7 @@
 </head>
 <body>
 <header>
-  <h1>前端代码审计 · 敏感信息 & API 递归发现 by inicd</h1>
+  <h1>前端代码审计 · 敏感信息 & API 递归发现 <span style="font-weight:400;color:var(--muted);font-size:14px">by inicd</span></h1>
   <div class="badges">
     <span id="badge-llm" class="badge off">DeepSeek: 检测中</span>
     <span id="badge-proxy" class="badge off">代理: 关</span>
@@ -89,12 +89,25 @@
     <div class="tab-content">
       <!-- 进度 -->
       <div id="tab-progress" class="tab-pane active">
+        <div class="progress-wrap">
+          <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+          <div class="progress-text" id="progress-text">0%</div>
+        </div>
+        <div class="live-controls">
+          <button id="pause" class="primary" type="button" style="display:none">暂停</button>
+          <label>并发 <input type="number" id="live-concurrency" min="1" max="500" value="20"></label>
+          <label>深度 <input type="number" id="live-depth" min="0" max="20" value="5"></label>
+          <button id="apply-config" class="ghost" type="button">应用配置</button>
+          <span class="hint">运行中可随时改并发/深度并应用，无需重跑；暂停后修改更稳妥</span>
+        </div>
         <div class="metrics">
           <div class="metric"><div class="k">抓取节点</div><div class="v" id="m-nodes">0</div></div>
+          <div class="metric"><div class="k">已发现 / 排队</div><div class="v" id="m-discovered" style="font-size:16px">0/0</div></div>
           <div class="metric"><div class="k">HTML / JS / JSON</div><div class="v" id="m-kinds">0/0/0</div></div>
           <div class="metric"><div class="k">审计发现</div><div class="v" id="m-findings">0</div></div>
           <div class="metric"><div class="k">接口探测</div><div class="v" id="m-endpoints">0</div></div>
           <div class="metric"><div class="k">LLM 调用</div><div class="v" id="m-llm">0</div></div>
+          <div class="metric"><div class="k">并发 / 深度</div><div class="v" id="m-conc" style="font-size:16px">0/0</div></div>
           <div class="metric"><div class="k">跳过(域/重/预算)</div><div class="v" id="m-skip">0/0/0</div></div>
           <div class="metric"><div class="k">状态</div><div class="v" id="m-status" style="font-size:14px">空闲</div></div>
           <div class="metric"><div class="k">耗时</div><div class="v" id="m-elapsed" style="font-size:16px">0s</div></div>

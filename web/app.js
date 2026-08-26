@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 let pollTimer = null;
 let startedAt = null;
+let currentStatus = "idle";
 
 // ---------- 初始化 ----------
 async function init() {
@@ -12,6 +13,8 @@ async function init() {
     $("llm").checked = cfg.llm_enabled && cfg.llm_available;
     $("proxy").checked = cfg.proxy_enabled;
     $("render_mode").value = cfg.render_mode || "hybrid";
+    $("live-concurrency").value = cfg.concurrency;
+    $("live-depth").value = cfg.max_depth;
     const llmBadge = $("badge-llm");
     llmBadge.textContent = "DeepSeek: " + (cfg.llm_available ? "已配置" : "未配置");
     llmBadge.className = "badge " + (cfg.llm_available ? "on" : "off");
@@ -68,21 +71,48 @@ $("start").addEventListener("click", async () => {
     proxy: $("proxy").checked,
     render_mode: $("render_mode").value,
   };
-  setControlsRunning(true);
+  updateControls("running");
   startedAt = Date.now();
   switchTab("progress");
   try {
     const res = await fetchJSON("/api/scan", { method: "POST", body });
     if (res.error) {
       setStatus(res.error, true);
-      setControlsRunning(false);
+      updateControls("idle");
       return;
     }
     pollTimer = setInterval(poll, 1000);
     poll();
   } catch (e) {
     setStatus("启动失败：" + e, true);
-    setControlsRunning(false);
+    updateControls("idle");
+  }
+});
+
+// ---------- 暂停 / 继续 ----------
+$("pause").addEventListener("click", async () => {
+  const target = currentStatus === "paused" ? "/api/scan/resume" : "/api/scan/pause";
+  try {
+    await fetchJSON(target, { method: "POST" });
+    poll();
+  } catch (e) {
+    setStatus("操作失败：" + e, true);
+  }
+});
+
+// ---------- 运行时应用配置（并发 / 深度） ----------
+$("apply-config").addEventListener("click", async () => {
+  const body = {
+    concurrency: parseInt($("live-concurrency").value, 10),
+    depth: parseInt($("live-depth").value, 10),
+  };
+  try {
+    const res = await fetchJSON("/api/scan/config", { method: "POST", body });
+    if (res.error) setStatus(res.error, true);
+    else setStatus("已应用：并发 " + res.concurrency + "，深度 " + res.max_depth);
+    poll();
+  } catch (e) {
+    setStatus("应用失败：" + e, true);
   }
 });
 
@@ -98,23 +128,37 @@ $("cancel").addEventListener("click", async () => {
 async function poll() {
   try {
     const s = await fetchJSON("/api/scan/status");
+    currentStatus = s.status;
     $("m-nodes").textContent = s.total_nodes ?? 0;
+    $("m-discovered").textContent = `${s.discovered ?? 0}/${s.pending ?? 0}`;
     $("m-kinds").textContent = `${s.html ?? 0}/${s.js ?? 0}/${s.json ?? 0}`;
     $("m-findings").textContent = s.findings ?? 0;
     $("m-endpoints").textContent = s.endpoints ?? 0;
     $("m-llm").textContent = `${s.llm_calls ?? 0}${s.llm_failures ? "/" + s.llm_failures : ""}`;
+    $("m-conc").textContent = `${s.concurrency ?? "-"}/${s.max_depth ?? "-"}`;
     $("m-skip").textContent = `${s.skipped_scope ?? 0}/${s.skipped_dup ?? 0}/${s.skipped_budget ?? 0}`;
     if (startedAt) $("m-elapsed").textContent = Math.floor((Date.now() - startedAt) / 1000) + "s";
+
+    // 进度条
+    const pct = clamp(s.progress ?? 0, 0, 100);
+    $("progress-fill").style.width = pct + "%";
+    $("progress-text").textContent =
+      `${pct}% · 完成 ${s.total_nodes ?? 0} / 排队 ${s.pending ?? 0} / 发现 ${s.discovered ?? 0}`;
+
+    // 运行中同步当前并发/深度到输入框（输入框聚焦时不覆盖，避免打断用户输入）
+    if (s.concurrency != null) syncInput($("live-concurrency"), s.concurrency);
+    if (s.max_depth != null) syncInput($("live-depth"), s.max_depth);
+
     if (s.logs) {
       const log = $("log");
       log.textContent = s.logs.join("\n");
       log.scrollTop = log.scrollHeight;
     }
     setStatus(statusText(s.status));
+    updateControls(s.status);
     if (s.status === "done" || s.status === "error" || s.status === "cancelled") {
       clearInterval(pollTimer);
       pollTimer = null;
-      setControlsRunning(false);
       await loadResults();
       if (s.status === "done") switchTab("findings");
     }
@@ -124,7 +168,18 @@ async function poll() {
 }
 
 function statusText(s) {
-  return { idle: "空闲", running: "扫描中…", done: "完成", error: "出错", cancelled: "已取消", cancelling: "取消中…" }[s] || s;
+  return {
+    idle: "空闲", running: "扫描中…", paused: "已暂停", done: "完成",
+    error: "出错", cancelled: "已取消", cancelling: "取消中…",
+  }[s] || s;
+}
+
+function syncInput(el, val) {
+  if (document.activeElement !== el) el.value = val;
+}
+
+function clamp(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, Number(v) || 0));
 }
 
 // ---------- 加载结果 ----------
@@ -206,10 +261,22 @@ async function fetchJSON(url, opts) {
   if (!r.ok && !data.error) data.error = "HTTP " + r.status;
   return data;
 }
-function setControlsRunning(running) {
-  $("start").disabled = running;
-  $("cancel").style.display = running ? "" : "none";
-  if (!running) startedAt = null;
+function updateControls(status) {
+  const active = status === "running" || status === "paused" || status === "cancelling";
+  $("start").disabled = active;
+  $("cancel").style.display = active ? "" : "none";
+  const pbtn = $("pause");
+  const showPause = status === "running" || status === "paused";
+  pbtn.style.display = showPause ? "" : "none";
+  if (status === "paused") {
+    pbtn.textContent = "继续";
+    pbtn.classList.add("paused");
+  } else {
+    pbtn.textContent = "暂停";
+    pbtn.classList.remove("paused");
+  }
+  $("apply-config").disabled = !(status === "running" || status === "paused");
+  if (!active) startedAt = null;
 }
 function setStatus(text, isError) {
   const el = $("m-status");

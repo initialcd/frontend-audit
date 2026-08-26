@@ -55,7 +55,7 @@ class MemoryHandler(logging.Handler):
 class ScanState:
     def __init__(self):
         self.scan_id = ""
-        self.status = "idle"  # idle|running|cancelling|done|error|cancelled
+        self.status = "idle"  # idle|running|paused|cancelling|done|error|cancelled
         self.params: dict = {}
         self.started_monotonic = 0.0
         self.summary: dict = {}
@@ -69,13 +69,33 @@ class ScanState:
 
     def live_snapshot(self) -> dict:
         # 运行中读 orchestrator 的实时计数器（跨线程读 int 字段，GIL 下安全）
-        if self.status in ("running", "cancelling") and self.orch is not None:
+        if self.status in ("running", "paused", "cancelling") and self.orch is not None:
             try:
                 s = dataclasses.asdict(self.orch.summary)
             except Exception:  # noqa: BLE001
                 s = self.summary
+            try:
+                s["paused"] = bool(self.orch.paused)
+                s["concurrency"] = int(self.orch.concurrency)
+                s["max_depth"] = int(self.orch.max_depth)
+            except Exception:  # noqa: BLE001
+                pass
         else:
             s = dict(self.summary)
+            s["paused"] = self.status == "paused"
+            s["concurrency"] = int(self.params.get("concurrency", 0) or 0)
+            s["max_depth"] = int(self.params.get("depth", 0) or 0)
+        s.setdefault("discovered", 0)
+        s.setdefault("pending", 0)
+        done = int(s.get("total_nodes", 0) or 0)
+        queued = int(s.get("pending", 0) or 0)
+        known = done + queued
+        if self.status == "done":
+            s["progress"] = 100.0
+        elif known > 0:
+            s["progress"] = round(done / known * 100.0, 1)
+        else:
+            s["progress"] = 0.0
         s["status"] = self.status
         s["scan_id"] = self.scan_id
         s["elapsed"] = int(time.monotonic() - self.started_monotonic) if self.started_monotonic else 0
@@ -91,7 +111,7 @@ class ScanManager:
 
     @property
     def running(self) -> bool:
-        return self.state.status in ("running", "cancelling")
+        return self.state.status in ("running", "paused", "cancelling")
 
     def start(self, params: dict) -> dict:
         with self._lock:
@@ -114,6 +134,57 @@ class ScanManager:
             self.state.orch.cancel()
         self.state.status = "cancelling"
         return {"status": "cancelling"}
+
+    def pause(self) -> dict:
+        if self.state.status != "running":
+            return {"status": self.state.status}
+        if self.state.orch is not None:
+            self.state.orch.pause()
+        self.state.status = "paused"
+        self.state.logs.append("[*] 已暂停（当前节点处理完成后挂起，进度保留，可直接改并发/深度）")
+        return {"status": "paused"}
+
+    def resume(self) -> dict:
+        if self.state.status != "paused":
+            return {"status": self.state.status}
+        if self.state.orch is not None:
+            self.state.orch.resume()
+        self.state.status = "running"
+        self.state.logs.append("[*] 已继续")
+        return {"status": "running"}
+
+    def update_config(self, params: dict) -> dict:
+        """运行时调整并发/深度/QPS，无需重跑。"""
+        if not self.running or self.state.orch is None:
+            return {"error": "当前没有运行中的扫描"}
+        orch = self.state.orch
+        changed: list[str] = []
+        if "concurrency" in params:
+            n = int(params["concurrency"])
+            if 1 <= n <= 500:
+                orch.set_concurrency(n)
+                self.state.params["concurrency"] = n
+                changed.append(f"并发={n}")
+        if "depth" in params:
+            d = int(params["depth"])
+            if 0 <= d <= 20:
+                orch.set_max_depth(d)
+                self.state.params["depth"] = d
+                changed.append(f"深度={d}")
+        if "qps" in params:
+            q = float(params["qps"])
+            if q >= 0:
+                orch.set_qps(q)
+                self.state.params["qps"] = q
+                changed.append(f"QPS={q}")
+        if changed:
+            self.state.logs.append("[*] 已应用运行时配置：" + "，".join(changed))
+        return {
+            "status": self.state.status,
+            "concurrency": orch.concurrency,
+            "max_depth": orch.max_depth,
+            "changed": changed,
+        }
 
     # ---------- 扫描线程 ----------
     def _run(self, state: ScanState, params: dict) -> None:
@@ -268,6 +339,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_start(params)
         if path == "/api/scan/cancel":
             return self._json(MGR.cancel())
+        if path == "/api/scan/pause":
+            return self._json(MGR.pause())
+        if path == "/api/scan/resume":
+            return self._json(MGR.resume())
+        if path == "/api/scan/config":
+            return self._json(MGR.update_config(params))
         return self._json({"error": "not found"}, 404)
 
     def _handle_start(self, params: dict) -> None:

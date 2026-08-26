@@ -45,6 +45,8 @@ SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 @dataclass
 class Summary:
     total_nodes: int = 0
+    discovered: int = 0
+    pending: int = 0
     fetched: int = 0
     html: int = 0
     js: int = 0
@@ -75,19 +77,119 @@ class Orchestrator:
         self.queue: asyncio.Queue[tuple[str, int, str]] = asyncio.Queue()
         self.per_domain: Counter[str] = Counter()
         self._cancel = False
+        self._paused = False
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()
+        self._concurrency = cfg.scan.concurrency
+        self._workers: list[asyncio.Task] = []
+        self._worker_seq = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._finished = False
 
-    def cancel(self) -> None:
-        """请求取消当前扫描：置标志并排空队列，让 worker 尽快退出。"""
+    # ---------- 暂停 / 恢复 / 动态调参（线程安全，均派发到事件循环） ----------
+    def cancel(self) -> bool:
+        """请求取消：置标志并排空队列（派发到事件循环执行，线程安全）。"""
         self._cancel = True
+        return self._schedule(self._do_cancel)
+
+    def pause(self) -> bool:
+        """暂停：worker 处理完当前节点后挂起，队列与进度全部保留。"""
+        return self._schedule(self._do_pause)
+
+    def resume(self) -> bool:
+        """恢复暂停的扫描，从断点继续，无需重跑。"""
+        return self._schedule(self._do_resume)
+
+    def set_concurrency(self, n: int) -> bool:
+        """运行时调整并发：新增/缩减 worker（缩减时 worker 处理完当前节点再退出）。"""
+        n = max(1, min(n, 500))
+        self._concurrency = n
+        self.cfg.scan.concurrency = n
+        return self._schedule(self._sync_workers)
+
+    def set_max_depth(self, n: int) -> bool:
+        """运行时调整递归深度上限（各处深度判断均为实时读取，立即生效）。"""
+        self.cfg.scan.max_depth = max(0, n)
+        return True
+
+    def set_qps(self, q: float) -> bool:
+        """运行时调整每域 QPS 限速。"""
+        q = max(0.0, q)
+        self.cfg.scan.per_domain_qps = q
+        limiter = getattr(self.fetcher, "limiter", None)
+        if limiter is not None:
+            limiter.qps = q
+        return True
+
+    async def _do_cancel(self) -> None:
+        self._cancel = True
+        self._pause_event.set()  # 唤醒暂停中的 worker，让其看到取消标志后退出
+        self._drain_queue()
+
+    async def _do_pause(self) -> None:
+        self._paused = True
+        self._pause_event.clear()
+
+    async def _do_resume(self) -> None:
+        self._paused = False
+        self._pause_event.set()
+
+    def _schedule(self, make_coro) -> bool:
+        """把协程派发到扫描事件循环。传入工厂函数，仅在确实要调度时才创建协程。"""
+        loop = self._loop
+        if loop is None or loop.is_closed() or self._finished:
+            return False
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        coro = make_coro()
+        if current is loop:
+            asyncio.create_task(coro)
+        else:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        return True
+
+    def _drain_queue(self) -> None:
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
-                self.queue.task_done()
-            except Exception:  # noqa: BLE001
+            except asyncio.QueueEmpty:
                 break
+            self.queue.task_done()
+            self.summary.pending -= 1
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
+    def concurrency(self) -> int:
+        return self._concurrency
+
+    @property
+    def max_depth(self) -> int:
+        return self.cfg.scan.max_depth
+
+    async def _sync_workers(self) -> None:
+        """按当前并发目标增/减 worker 数量。"""
+        if self._finished:
+            return
+        # 清理已退出的 worker（缩减并发后它们会自行退出）
+        self._workers = [w for w in self._workers if not w.done()]
+        while len(self._workers) < self._concurrency:
+            wid = self._worker_seq
+            self._worker_seq += 1
+            self._workers.append(asyncio.create_task(self._worker(wid)))
 
     # ---------- 入口 ----------
     async def run(self, seeds: list[str]) -> Summary:
+        self._loop = asyncio.get_running_loop()
+        self._finished = False
+        self._cancel = False
+        self._paused = False
+        self._pause_event.set()
+        self._workers = []
         seen = await self.store.load_seen_urls()
         self.dedup.seen_urls |= seen
         if seen:
@@ -103,27 +205,24 @@ class Orchestrator:
             await self._enqueue(seed, 0, "seed")
         if self.queue.empty():
             logger.warning("队列为空，没有可扫描的目标")
+            self._finished = True
             return self.summary
-        workers = [
-            asyncio.create_task(self._worker(i)) for i in range(self.cfg.scan.concurrency)
-        ]
-        # 等待队列排空；支持中途取消（cancel 排空队列后会跳出）
+        await self._sync_workers()
+        # 等待队列排空；暂停时 worker 挂起在 _pause_event，join 持续等待属正常。
+        # 支持中途取消：cancel 会排空队列并唤醒暂停 worker。
         while True:
             try:
                 await asyncio.wait_for(self.queue.join(), timeout=0.5)
                 break
             except asyncio.TimeoutError:
                 if self._cancel:
-                    while not self.queue.empty():
-                        try:
-                            self.queue.get_nowait()
-                            self.queue.task_done()
-                        except Exception:  # noqa: BLE001
-                            break
+                    self._drain_queue()
                     break
-        for w in workers:
+        # 结束：先置完成标志，阻止后续动态调参再派生 worker
+        self._finished = True
+        for w in self._workers:
             w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(*self._workers, return_exceptions=True)
         return self.summary
 
     async def _enqueue(self, url: str, depth: int, source: str) -> bool:
@@ -139,11 +238,16 @@ class Orchestrator:
             return False
         self.dedup.mark_url(h)
         await self.queue.put((canonical, depth, source))
+        self.summary.discovered += 1
+        self.summary.pending += 1
         return True
 
     async def _worker(self, wid: int) -> None:
         while True:
-            if self._cancel:
+            if self._cancel or wid >= self._concurrency:
+                return
+            await self._pause_event.wait()
+            if self._cancel or wid >= self._concurrency:
                 return
             url, depth, source = await self.queue.get()
             try:
@@ -154,6 +258,7 @@ class Orchestrator:
                 logger.exception("处理失败 %s：%s", url, exc)
             finally:
                 self.queue.task_done()
+                self.summary.pending -= 1
 
     # ---------- 单节点处理 ----------
     async def _process(self, url: str, depth: int, source: str) -> None:

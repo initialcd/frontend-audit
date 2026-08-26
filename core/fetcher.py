@@ -77,7 +77,9 @@ class Fetcher:
                     "application/json,*/*;q=0.8"
                 ),
             },
-            limits=httpx.Limits(max_connections=cfg.scan.concurrency * 2),
+            # 连接池上限给足余量：运行时并发最高可调到 500，加上接口探测的半并发，
+            # 避免"提高并发却被连接池卡住"。
+            limits=httpx.Limits(max_connections=max(cfg.scan.concurrency * 2, 1000)),
         )
 
     async def close(self) -> None:
