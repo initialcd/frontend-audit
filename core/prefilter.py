@@ -85,11 +85,52 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern]] = [
 ]
 
 # ---------- 版本信息 ----------
+# 每条规则的第一捕获组必须是版本号本身（_iter_hits 统一取 group(1)）。
 VERSION_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("assignment", re.compile(r"""(?i)(?:version|ver)["']?\s*[:=]\s*["']([0-9][0-9a-zA-Z.\-]{0,24})["']""")),
+    # 1) 赋值/JSON：version / appVersion / build_version / release 等，值可带 v 前缀、可无引号
+    (
+        "assignment",
+        re.compile(
+            r"""(?i)(?:version|ver|\b(?:release|build|revision)\b)["']?[_\-]*(?:str|num|no|code)?["']?\s*[:=]\s*["']?(v?\d[\w.\-]{0,24})"""
+        ),
+    ),
+    # 2) 库指纹 / CDN 路径：jquery/3.6.0、jquery-3.6.0.min.js、vue@2.6.14（点分结构，避免吃到 .min.js）
     (
         "lib_fingerprint",
-        re.compile(r"""(?i)(jquery|vue(?:\.min)?|react(?:-dom)?|angular(?:js)?|bootstrap|lodash)[./-]v?([0-9][0-9a-z.\-]{0,12})"""),
+        re.compile(
+            r"""(?i)(?:jquery|vue(?:\.min)?|react(?:-dom)?|angular(?:js)?|bootstrap|lodash|moment|axios|echarts|element-ui|element-plus|antd|d3|three|layui|swiper)[./@-]v?(\d+(?:\.\d+){0,3})"""
+        ),
+    ),
+    # 3) JSDoc / 注释标注：@version 1.2.3
+    (
+        "jsdoc",
+        re.compile(r"""(?i)@version\s+v?(\d[\w.\-]{0,12})"""),
+    ),
+    # 4) HTML meta generator：WordPress / Drupal / Discuz 等建站程序版本
+    (
+        "meta_generator",
+        re.compile(
+            r"""(?i)<meta[^>]+(?:name|content)\s*=\s*["'][^"']*?\b(?:wordpress|drupal|joomla|phpbb|discuz|empirecms|dedecms|thinkphp)[^"']*?[v\s/-](\d[\w.\-]{0,12})"""
+        ),
+    ),
+    # 5) URL 查询参数：?v=3.6.0、?version=1.2、?ver=2.0
+    (
+        "query_param",
+        re.compile(r"""(?i)[?&](?:v|ver|version)=v?(\d+(?:\.\d+){0,3})"""),
+    ),
+    # 6) 库版权注释：/*! jQuery v3.6.0 | ... */
+    (
+        "lib_comment",
+        re.compile(
+            r"""(?i)(?:jquery|vue|react(?:-dom)?|angular(?:js)?|bootstrap|lodash|moment|axios|echarts|element-ui|element-plus|antd|d3|three|layui|swiper)\s+v?(\d[\w.\-]{0,12})"""
+        ),
+    ),
+    # 7) 依赖声明：package.json 风格 "lodash": "^4.17.21"
+    (
+        "dep_decl",
+        re.compile(
+            r"""(?i)["'](?:jquery|vue|react(?:-dom)?|angular(?:js)?|bootstrap|lodash|moment|axios|echarts|element-ui|element-plus|antd|d3|three|layui|swiper)["']\s*:\s*["'](?:[\^~]|>=?|<=?)?v?(\d[\w.\-]{0,12})"""
+        ),
     ),
 ]
 
@@ -204,7 +245,7 @@ def prefilter_js(text: str, context: int = 100, cap: int = 12000) -> PrefilterRe
 
 
 def prefilter_text(text: str, context: int = 100, cap: int = 12000) -> PrefilterResult:
-    """对 JSON / 内联脚本等非 JS 文本做轻量扫描：路径 + 密钥（不进 LLM）。"""
+    """对 JSON / 内联脚本等非 JS 文本做轻量扫描：路径 + 密钥 + 版本（不进 LLM）。"""
     res = PrefilterResult()
     for m in API_ABSOLUTE_RE.finditer(text):
         res.api_paths.append(m.group(1))
@@ -218,6 +259,12 @@ def prefilter_text(text: str, context: int = 100, cap: int = 12000) -> Prefilter
             conf = 0.9 if name in ("generic_secret", "jwt") else 0.95
             res.findings.append(LocalFinding(
                 name, severity, value, _context(text, start, end, context), conf, "本地正则命中"
+            ))
+            hits.append((start, end))
+    for name, pattern in VERSION_PATTERNS:
+        for start, end, value in _iter_hits(pattern, text):
+            res.findings.append(LocalFinding(
+                "version", "low", value, _context(text, start, end, context), 0.7, name
             ))
             hits.append((start, end))
     res.snippets = _build_snippets(text, hits, context, cap)
