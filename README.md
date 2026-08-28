@@ -50,6 +50,22 @@ v2.1 新增**纯下载模式**：如果你只想把前端代码完整下载到�
 
 这些正则匹配完全在本地运行，**不需要联网、不消耗任何费用**。
 
+### 版本号识别（本地正则）
+
+工具会从下载到的代码中自动提取**框架 / 中间件 / 第三方库的版本号**，用于识别存在已知漏洞的组件。覆盖的版本号写法包括：
+
+| 规则 | 覆盖写法 | 示例 |
+|------|---------|------|
+| 赋值 / JSON | JS 变量赋值、JSON 字段（含 `__VERSION__`、`build_version`、`release`、v 前缀、无引号数字） | `"admin_version":"2.1.2"`、`window.__VERSION__ = 2.0` |
+| 库指纹 / CDN 路径 | 文件名或路径中的库版本 | `jquery-3.6.0.min.js`、`vue@2.6.14/dist/vue.js` |
+| JSDoc 标注 | 注释中的 `@version` | `@version 1.2.3` |
+| HTML meta | 建站程序版本（WordPress / Drupal / Discuz 等） | `<meta name="generator" content="WordPress 5.8.1">` |
+| URL 查询参数 | 资源引用的 `?v=` / `?version=` | `jquery.min.js?v=3.6.0` |
+| 库版权注释 | 压缩库头部注释 | `/*! jQuery v3.6.0 | (c) */` |
+| 依赖声明 | package.json 风格依赖版本 | `"lodash": "^4.17.21"` |
+
+典型场景：XXL-JOB 的登录页 HTML 内嵌 `"admin_version":"2.1.2"`，工具会直接提取出版本号 `2.1.2`，便于后续对照已知漏洞（如老版本未授权访问 / 默认口令 / GLUE RCE）。
+
 ### 3. API 路径智能发现（LinkFinder 级别正则）
 
 这个功能就是你提到的"**正则匹配路径**"——工具使用了业界知名的 **LinkFinder 正则模式**，能从 JS 代码的字符串字面量中精准提取出 API 接口路径，包括：
