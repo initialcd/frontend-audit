@@ -8,4 +8,5 @@ state*.db
 reports/
 reports-smoke/
 reports-ui/
+downloads/
 config.yaml

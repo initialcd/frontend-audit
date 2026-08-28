@@ -1,4 +1,4 @@
-# 前端代码批量审计工具 — 功能讲解
+# 前端代码批量审计 + 下载工具 — 功能讲解
 
 ## 一、这个工具是做什么的？
 
@@ -12,11 +12,13 @@
 
 同时，它还会**自动发现网站背后隐藏的 API 接口路径**，并尝试探测这些接口支持哪些请求方法（GET、POST、OPTIONS 等），帮你梳理出完整的接口清单。
 
+v2.1 新增**纯下载模式**：如果你只想把前端代码完整下载到本地做人工审计或 grep 分析，一行命令即可，不消耗 LLM token。
+
 ---
 
 ## 二、核心功能一览
 
-### 1. 网站资源自动下载
+### 1. 网站资源自动下载（递归爬取，非目录爆破）
 
 你把一个网站 URL 列表交给工具，它会：
 
@@ -25,6 +27,8 @@
 - 从 JS 文件中提取动态加载的 chunk 分包、sourcemap 文件，继续下载
 - 自动跳过图片、字体、视频等静态资源（不浪费时间和流量）
 - 支持断点续跑：如果中途中断了，下次运行会自动跳过已经下载过的内容
+
+**递归 vs 爆破的核心区别**：工具采用**递归爬取**策略——只下载页面代码中实际引用的资源，不是用字典去猜路径（目录爆破）。递归能精准命中所有动态命名的文件（如 `chunk-2d0a3b4c.js`），目录爆破则完全无法覆盖这类带 hash 的文件名，且会产生大量 404 噪声。
 
 ### 2. 正则匹配敏感信息（本地扫描，零成本）
 
@@ -147,7 +151,7 @@ CDP 方式：浏览器发出的每一个请求 → 全部拦截记录 → 一个
 
 ---
 
-## 三、两种使用方式
+## 三、三种使用方式
 
 ### 方式一：Web UI（推荐，图形界面）
 
@@ -165,7 +169,7 @@ python webui.py
 - 完成后切换到"发现/接口/节点"标签查看结果
 - 可以下载 `report.md` 和 `full.json` 报告
 
-### 方式二：命令行
+### 方式二：命令行审计模式
 
 ```bash
 # 从 URL 列表文件扫描
@@ -177,6 +181,47 @@ python main.py -u https://target.example.com --domains target.example.com
 # 纯本地正则模式（不调 AI）
 python main.py -u urls.txt -d 4 --no-llm --domains example.com
 ```
+
+### 方式三：命令行下载模式（新增）
+
+纯前端资源下载，不审计、不调 LLM、不探测接口。复用审计管道的递归爬取引擎，**下载能力与审计模式完全一致**（HTML 提取 `<script>`、JS 提取 chunk/sourcemap）。
+
+```bash
+# 下载单个站点的前端资源
+python main.py --download -u https://target.example.com/xxl-job-admin/ --domains target.example.com -o ./xxljob-dump
+
+# 批量下载：从 URL 清单文件读取，一行一个
+python main.py --download -u targets.txt --domains example.com -o ./frontend-dump -d 3
+
+# 搭配代理
+python main.py --download -u targets.txt --domains example.com -o ./dump -c config.yaml
+```
+
+下载后的目录结构：
+
+```
+downloads/
+└── target.example.com/
+    ├── xxl-job-admin/
+    │   ├── index.html
+    │   └── toLogin.html
+    ├── static/
+    │   └── js/
+    │       ├── app.bf3d9a2b.js
+    │       ├── chunk-vendors.7c8e.js
+    │       └── chunk-common.1a2b.js
+    └── js/
+        └── jquery.min.js
+```
+
+下载模式专用参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--download` | - | 开启下载模式 |
+| `-o` / `--output` | `downloads` | 输出目录 |
+| `-d` / `--depth` | 配置文件值 | 递归深度 |
+| `--domains` | 配置文件值 | 域名白名单（必填） |
 
 ---
 
@@ -251,6 +296,7 @@ python -m playwright install chromium
 ## 八、工作流程总结
 
 ```
+审计模式：
 你提供一个 URL 列表
     ↓
 工具自动访问每个 URL，下载 HTML/JS 代码
@@ -266,10 +312,18 @@ python -m playwright install chromium
 对发现的接口做 OPTIONS/POST 探测
     ↓
 生成 report.md 和 full.json 报告
+
+下载模式：
+你提供一个 URL 列表
+    ↓
+工具递归爬取所有前端资源（HTML/JS/JSON/SourceMap）
+    ↓
+按域名+路径结构存盘到本地目录
+    ↓
+拿到的文件直接用于人工审计或 grep 分析
 ```
 
 整个过程全自动，你只需要提供 URL 和域名白名单，等报告出来就行。如果追求最高覆盖率，建议安装 Playwright 并将 `render_mode` 设为 `full`。
-
 
 
 ## 九、使用方法
