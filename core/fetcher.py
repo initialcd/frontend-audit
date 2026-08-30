@@ -118,7 +118,10 @@ class Fetcher:
         return FetchResult(url=url, error="max retries exceeded")
 
     async def _once(self, url: str, options: dict) -> FetchResult:
-        limit = self.cfg.max_asset_kb * 1024
+        # 硬上限：仅用于防止超大响应（如几百 MB 视频流）拖垮内存。
+        # 现代前端打包产物（webpack bundle 5-10MB）远低于此上限，会完整读取，
+        # 交给 prefilter 阶段按 chunk_scan_kb 分段扫描，不再整体丢弃。
+        limit = self.cfg.max_body_kb * 1024
         async with self.client.stream("GET", url, **options) as resp:
             fr = FetchResult(
                 url=url,
@@ -143,7 +146,7 @@ class Fetcher:
                     break
                 chunks.append(chunk)
             if overflow:
-                fr.error = f"size exceeds {self.cfg.max_asset_kb}KB"
+                fr.error = f"size exceeds {self.cfg.max_body_kb}KB"
                 return fr
             fr.body = b"".join(chunks)
             fr.size = size

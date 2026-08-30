@@ -1,349 +1,140 @@
-# 前端代码批量审计 + 下载工具 — 功能讲解
+# 前端代码审计 + 下载工具
 
-## 一、这个工具是做什么的？
+递归下载目标网站的前端资源（HTML / JS / JSON / sourcemap），本地正则扫描敏感信息与接口路径，可选调用 DeepSeek 做二次语义审计。提供 CLI 和 Web UI 两种入口，另附纯下载模式。
 
-简单来说，这个工具可以**自动访问你指定的网站，把前端代码（网页源码、JavaScript 文件）全部下载下来，然后自动扫描里面有没有泄露的敏感信息**，比如：
+## 功能
 
-- 账号密码
-- 云服务密钥（阿里云、腾讯云、AWS 的 AccessKey / SecretKey）
-- API 接口地址
-- 数据库连接串
-- 各种 Token、私钥、第三方服务凭证
+- 递归爬取：从种子 URL 出发，提取 HTML 中的 `<script>`、JS 中的 chunk/sourcemap，持续扩展下载范围，不做目录爆破。
+- 本地正则扫描：密钥、Token、版本号、API 路径，零 token 成本。
+- LLM 二次审计：把正则命中的可疑片段交给 DeepSeek 确认，默认只对 JS 开启，JSON 可按需开启。
+- 接口探测：对发现的 API 路径发 OPTIONS / POST，判断可用方法与 CORS。
+- 增强渲染：Playwright + CDP + JS Hook，捕获 SPA 动态加载的代码。
+- 域名白名单约束：未配置白名单拒绝运行，递归不越界。
 
-同时，它还会**自动发现网站背后隐藏的 API 接口路径**，并尝试探测这些接口支持哪些请求方法（GET、POST、OPTIONS 等），帮你梳理出完整的接口清单。
-
-v2.1 新增**纯下载模式**：如果你只想把前端代码完整下载到本地做人工审计或 grep 分析，一行命令即可，不消耗 LLM token。
-
----
-
-## 二、核心功能一览
-
-### 1. 网站资源自动下载（递归爬取，非目录爆破）
-
-你把一个网站 URL 列表交给工具，它会：
-
-- 自动访问每个 URL，下载网页（HTML）和 JavaScript 文件
-- 从 HTML 中提取 `<script>` 标签引用的外部 JS 文件，一并下载
-- 从 JS 文件中提取动态加载的 chunk 分包、sourcemap 文件，继续下载
-- 自动跳过图片、字体、视频等静态资源（不浪费时间和流量）
-- 支持断点续跑：如果中途中断了，下次运行会自动跳过已经下载过的内容
-
-**递归 vs 爆破的核心区别**：工具采用**递归爬取**策略——只下载页面代码中实际引用的资源，不是用字典去猜路径（目录爆破）。递归能精准命中所有动态命名的文件（如 `chunk-2d0a3b4c.js`），目录爆破则完全无法覆盖这类带 hash 的文件名，且会产生大量 404 噪声。
-
-### 2. 正则匹配敏感信息（本地扫描，零成本）
-
-工具内置了大量正则表达式规则，可以在下载到的代码中自动匹配以下敏感信息：
-
-| 类型 | 说明 |
-|------|------|
-| 阿里云 AK | `LTAI` 开头的 AccessKey |
-| 腾讯云 AK | `AKID` 开头的密钥 |
-| AWS AK | `AKIA` / `ASIA` 开头的密钥 |
-| OpenAI API Key | `sk-` 开头的密钥 |
-| GitHub Token | `ghp_` / `ghs_` 等开头的令牌 |
-| Google API Key | `AIza` 开头的密钥 |
-| JWT Token | 三段式 Base64 编码的令牌 |
-| 私钥 | `-----BEGIN PRIVATE KEY-----` 格式的私钥文件内容 |
-| 数据库连接串 | `mongodb://`、`mysql://`、`redis://` 等含账号密码的连接地址 |
-| 通用密码/Token | 代码中 `password = "xxx"`、`secret = "xxx"` 等硬编码 |
-| 第三方凭证 | Slack Token、Stripe 支付密钥等 |
-
-这些正则匹配完全在本地运行，**不需要联网、不消耗任何费用**。
-
-### 版本号识别（本地正则）
-
-工具会从下载到的代码中自动提取**框架 / 中间件 / 第三方库的版本号**，用于识别存在已知漏洞的组件。覆盖的版本号写法包括：
-
-| 规则 | 覆盖写法 | 示例 |
-|------|---------|------|
-| 赋值 / JSON | JS 变量赋值、JSON 字段（含 `__VERSION__`、`build_version`、`release`、v 前缀、无引号数字） | `"admin_version":"2.1.2"`、`window.__VERSION__ = 2.0` |
-| 库指纹 / CDN 路径 | 文件名或路径中的库版本 | `jquery-3.6.0.min.js`、`vue@2.6.14/dist/vue.js` |
-| JSDoc 标注 | 注释中的 `@version` | `@version 1.2.3` |
-| HTML meta | 建站程序版本（WordPress / Drupal / Discuz 等） | `<meta name="generator" content="WordPress 5.8.1">` |
-| URL 查询参数 | 资源引用的 `?v=` / `?version=` | `jquery.min.js?v=3.6.0` |
-| 库版权注释 | 压缩库头部注释 | `/*! jQuery v3.6.0 | (c) */` |
-| 依赖声明 | package.json 风格依赖版本 | `"lodash": "^4.17.21"` |
-
-典型场景：XXL-JOB 的登录页 HTML 内嵌 `"admin_version":"2.1.2"`，工具会直接提取出版本号 `2.1.2`，便于后续对照已知漏洞（如老版本未授权访问 / 默认口令 / GLUE RCE）。
-
-### 3. API 路径智能发现（LinkFinder 级别正则）
-
-这个功能就是你提到的"**正则匹配路径**"——工具使用了业界知名的 **LinkFinder 正则模式**，能从 JS 代码的字符串字面量中精准提取出 API 接口路径，包括：
-
-- 绝对路径：`https://api.example.com/v1/users`
-- 相对路径：`/api/v1/login`、`../admin/config`
-- 带扩展名的路径：`/user/info.action`、`/data/list.json`、`/config.php`
-- 字符串拼接的路径：`"/api/" + version + "/user"` 也会被提取出来
-
-**发现路径后，工具会自动递归访问这些路径**（限定在白名单范围内），如果返回的是 HTML 或 JS，就继续下载和审计，形成"发现 → 下载 → 再发现 → 再下载"的递归链条。
-
-### 4. DeepSeek AI 智能审计（可选）
-
-对于本地正则无法覆盖的复杂场景（比如各种奇怪的编码方式、业务逻辑中硬编码的凭证），工具可以调用 DeepSeek 大模型进行二次审计。
-
-**但是不会浪费钱**——只有本地正则命中了可疑内容，才会把命中位置周围的一小段代码（约 200 字符）发给 AI 确认，不会把整个文件发过去。这叫做"Token 漏斗"设计，每一层都尽量便宜。
-
-不想用 AI 的话，可以关掉，工具会变成纯本地正则模式，完全免费。
-
-### 5. 接口多方法探测
-
-发现 API 路径后，工具会自动用 OPTIONS 和 POST 方法去探测：
-
-- **OPTIONS**：查看接口支持哪些 HTTP 方法（Allow 头），以及是否允许跨域（CORS 头）
-- **POST**：发送空请求体，查看接口返回什么状态码（判断接口是否存在）
-
-安全保护：路径中包含 `delete`、`upload`、`pay`、`order`、`reset` 等危险词的，会自动跳过 POST 探测，避免误触发业务操作。
-
-### 6. 增强渲染引擎 — 前端代码近全覆盖下载（v2.0 新增）
-
-这是本工具最强大的功能。普通的 HTTP 请求工具只能下载 HTML 中直接引用的 JS 文件，面对现代前端应用（Vue、React、Angular 等）会大量遗漏。增强渲染引擎通过**三层捕获机制**，将前端代码覆盖率从 ~60% 提升到 ~95%。
-
-#### 三层捕获机制
-
-**第一层：CDP 协议层拦截（核心）**
-
-通过 Chrome DevTools Protocol 直接监听浏览器内核层面的**所有网络请求和响应**。浏览器加载的每一个 JS 文件——无论是通过 `<script>` 标签、`import()`、`fetch()`、`XMLHttpRequest` 还是 WebSocket 加载的——都能被完整捕获。
-
-```
-传统方式：用正则猜 URL → 发请求验证 → 漏掉大量动态加载的 JS
-CDP 方式：浏览器发出的每一个请求 → 全部拦截记录 → 一个不漏
-```
-
-**第二层：JS 运行时 Hook（深层）**
-
-在页面中注入 JavaScript 拦截代码，捕获以下动态代码执行：
-
-| Hook 目标 | 说明 |
-|-----------|------|
-| `eval()` | 拦截通过 eval 执行的动态代码 |
-| `new Function()` | 拦截通过 Function 构造函数执行的代码 |
-| `document.createElement('script')` | 拦截动态创建的 script 标签 |
-| `MutationObserver` | 监听 DOM 中新增的 script 和 iframe 元素 |
-| `WebSocket` | 拦截 WebSocket 连接和消息发送 |
-
-**第三层：全交互自动化（广度）**
-
-不再只是点击 `<a>` 和 `<button>`，而是模拟完整用户行为来触发所有懒加载代码：
-
-| 交互类型 | 触发的代码 |
-|----------|-----------|
-| 滚动所有可滚动区域 | 无限滚动列表、图片懒加载 |
-| Hover 所有下拉菜单和弹出层 | 菜单组件、工具提示的按需加载 |
-| 填写表单输入框和下拉选择 | 搜索联想、联动筛选的 JS |
-| 遍历 SPA 路由（Vue Router / React Router） | 每个页面对应的 chunk 分包 |
-| 点击 Tab、手风琴、折叠面板 | 隐藏内容区域的按需加载 |
-
-#### 三种渲染模式
-
-在 `config.yaml` 中通过 `render_mode` 配置：
-
-| 模式 | 说明 | 适用于 |
-|------|------|--------|
-| `hybrid`（默认） | 仅对 SPA 空壳页面启用增强渲染 | 一般场景，平衡覆盖率和速度 |
-| `full` | 对所有 HTML 页面都启用增强渲染 | 追求最高覆盖率，速度较慢 |
-| `off` | 完全关闭渲染，纯 httpx 模式 | 不需要动态分析的场景 |
-
-#### 效果对比
-
-| 场景 | 纯 httpx 模式 | 增强渲染模式 |
-|------|-------------|-------------|
-| 传统多页网站 | 能抓到大部分 | 能抓到全部 |
-| Vue/React SPA | 只能抓到空壳 | 能抓到所有 chunk |
-| 动态 import() 加载 | 完全抓不到 | 能抓到 |
-| eval() 执行的代码 | 完全抓不到 | Hook 拦截记录 |
-| 懒加载的组件 | 完全抓不到 | 全交互触发后能抓到 |
-| WebSocket 推送 | 完全抓不到 | Hook 拦截记录 |
-
-### 7. 代理池支持
-
-如果你需要通过代理访问目标（比如配合 TscanPlus 等代理池工具），工具支持两种模式：
-
-- **本地代理模式**：所有流量走你指定的本地代理端口
-- **API 代理池模式**：定时从代理池 API 拉取代理列表，轮询使用，失败自动切换
-
-### 8. 域名白名单安全约束
-
-工具**强制要求**配置授权域名白名单，不配置就拒绝运行。递归扫描永远不会跳出白名单范围，确保不会误扫到其他网站。
-
----
-
-## 三、三种使用方式
-
-### 方式一：Web UI（推荐，图形界面）
-
-```bash
-python webui.py
-```
-
-浏览器打开 `http://127.0.0.1:8000`，在网页上操作：
-
-- 左侧填授权扫描清单（每行一个 URL）和域名白名单
-- 调整深度、并发数、QPS 等参数
-- 勾选是否启用 DeepSeek AI 和代理
-- 点击"开始扫描"
-- 右侧实时看进度日志和计数器
-- 完成后切换到"发现/接口/节点"标签查看结果
-- 可以下载 `report.md` 和 `full.json` 报告
-
-### 方式二：命令行审计模式
-
-```bash
-# 从 URL 列表文件扫描
-python main.py -u urls.txt -c config.yaml
-
-# 扫描单个 URL
-python main.py -u https://target.example.com --domains target.example.com
-
-# 纯本地正则模式（不调 AI）
-python main.py -u urls.txt -d 4 --no-llm --domains example.com
-```
-
-### 方式三：命令行下载模式（新增）
-
-纯前端资源下载，不审计、不调 LLM、不探测接口。复用审计管道的递归爬取引擎，**下载能力与审计模式完全一致**（HTML 提取 `<script>`、JS 提取 chunk/sourcemap）。
-
-```bash
-# 下载单个站点的前端资源
-python main.py --download -u https://target.example.com/xxl-job-admin/ --domains target.example.com -o ./xxljob-dump
-
-# 批量下载：从 URL 清单文件读取，一行一个
-python main.py --download -u targets.txt --domains example.com -o ./frontend-dump -d 3
-
-# 搭配代理
-python main.py --download -u targets.txt --domains example.com -o ./dump -c config.yaml
-```
-
-下载后的目录结构：
-
-```
-downloads/
-└── target.example.com/
-    ├── xxl-job-admin/
-    │   ├── index.html
-    │   └── toLogin.html
-    ├── static/
-    │   └── js/
-    │       ├── app.bf3d9a2b.js
-    │       ├── chunk-vendors.7c8e.js
-    │       └── chunk-common.1a2b.js
-    └── js/
-        └── jquery.min.js
-```
-
-下载模式专用参数：
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--download` | - | 开启下载模式 |
-| `-o` / `--output` | `downloads` | 输出目录 |
-| `-d` / `--depth` | 配置文件值 | 递归深度 |
-| `--domains` | 配置文件值 | 域名白名单（必填） |
-
----
-
-## 四、输出报告
-
-每次扫描完成后，会在 `reports/` 目录下生成以时间戳命名的文件夹，包含：
-
-| 文件 | 内容 |
-|------|------|
-| `report.md` | 可读报告，包含敏感信息表、接口探测表、抓取节点明细 |
-| `full.json` | 全量结构化数据，方便导入其他系统分析 |
-
-示例报告内容：
-
-```
-## 敏感信息发现
-| 级别 | 类型 | 值 | 来源 | 置信度 |
-| critical | aliyun_ak | LTAI5txxxxxxxxxx | app.js | 0.95 |
-| high | jwt | eyJhbGciOi... | chunk-home.js | 0.90 |
-
-## 接口探测
-| 接口 | GET(抓取) | OPTIONS | POST | CORS |
-| /api/v1/users | 200 | 200 | 405 | * |
-| /api/v1/login | 200 | 200 | 200 | - |
-
-## 抓取节点明细
-| URL | 状态 | 类型 | 大小 | 深度 |
-| /index.html | 200 | html | 15KB | 0 |
-| /js/app.js | 200 | js | 320KB | 1 |
-```
-
----
-
-## 五、关键参数说明
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| 递归深度 | 5 | 种子 URL 为第 0 层，每发现一个子链接深度 +1 |
-| 每域节点上限 | 2000 | 同一个域名最多抓取 2000 个 URL |
-| 全局节点上限 | 10000 | 整个扫描最多抓取 10000 个 URL |
-| 并发数 | 20 | 同时发起多少个请求 |
-| 每域 QPS | 5 | 每个域名每秒最多发几个请求（防封 IP） |
-| 文件大小上限 | 2MB | 超过此大小的文件只记录不下载 |
-| 渲染模式 | hybrid | off=纯httpx / hybrid=仅SPA空壳启用 / full=全部HTML启用增强渲染 |
-
----
-
-## 六、安装
+## 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-如果需要 SPA 渲染功能，还需安装 Playwright 浏览器：
+需要 SPA 动态渲染时，额外安装 Playwright 浏览器：
 
 ```bash
 pip install playwright
 python -m playwright install chromium
 ```
 
----
+## 配置
 
-## 七、注意事项
+复制 `config.example.yaml` 为 `config.yaml` 后按需修改。DeepSeek API Key 也可通过环境变量 `DEEPSEEK_API_KEY` 提供，避免写入文件。
 
-1. **仅用于授权测试**：本工具只应在自有资产或获得书面授权的目标上使用，请遵守当地法律法规。
-2. **配置白名单**：必须在 `config.yaml` 的 `scope.domains` 中填写授权域名，否则工具拒绝运行。
-3. **DeepSeek Key**：如果需要 AI 审计功能，在 `config.yaml` 中填写 `api_key`，或设置环境变量 `DEEPSEEK_API_KEY`。
-4. **QPS 控制**：建议根据目标承受能力调整 `per_domain_qps`，避免触发 WAF 或封禁。
+```yaml
+deepseek:
+  api_key: ""            # DeepSeek API Key，留空则关闭 LLM
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
 
----
+scan:
+  concurrency: 20        # 并发请求数
+  per_domain_qps: 5.0    # 每域名每秒请求上限
+  timeout: 15.0
+  retries: 2
+  max_depth: 5           # 递归深度，种子为第 0 层
+  max_nodes_per_domain: 2000
+  max_total_nodes: 10000
+  max_body_kb: 51200     # 响应体硬上限（KB），超过丢弃保护内存（默认 50MB）
+  chunk_scan_kb: 2048    # 大文本分段扫描块大小（KB），超过则分块 prefilter
+  llm_enabled: true      # 是否启用 LLM 审计
+  audit_json: false      # 是否对 JSON 也送 LLM（默认关）
+  llm_full_audit: false  # 全量片段送 LLM：对无正则命中但可能有语义漏洞的 JS 也送全文片段
+  llm_full_audit_domains: []  # 特定域名白名单：命中则全量片段送 LLM
+  render_mode: "hybrid"  # off / hybrid / full
 
-## 八、工作流程总结
+scope:
+  domains: []            # 授权域名白名单，必填
+  allow_subdomains: true
 
+proxy:
+  enabled: false
+  mode: "local"          # local / api
+  local_url: "http://127.0.0.1:8080"
+
+storage:
+  db_path: "state.db"
+  output_dir: "reports"
 ```
-审计模式：
-你提供一个 URL 列表
-    ↓
-工具自动访问每个 URL，下载 HTML/JS 代码
-    ↓
-（可选）增强渲染引擎：CDP 拦截 + JS Hook + 全交互自动化，捕获动态加载代码
-    ↓
-本地正则扫描：匹配密钥、密码、Token、API 路径
-    ↓
-（可选）DeepSeek AI 对可疑片段二次确认
-    ↓
-发现的新 API 路径自动递归访问（在白名单范围内）
-    ↓
-对发现的接口做 OPTIONS/POST 探测
-    ↓
-生成 report.md 和 full.json 报告
 
-下载模式：
-你提供一个 URL 列表
-    ↓
-工具递归爬取所有前端资源（HTML/JS/JSON/SourceMap）
-    ↓
-按域名+路径结构存盘到本地目录
-    ↓
-拿到的文件直接用于人工审计或 grep 分析
+域名白名单也可以在命令行用 `--domains` 覆盖，或 Web UI 中填写。
+
+## CLI 用法
+
+### 审计模式
+
+```bash
+# 从 URL 清单扫描
+python main.py -u urls.txt -c config.yaml
+
+# 单个 URL
+python main.py -u https://target.example.com --domains target.example.com
+
+# 关闭 LLM，仅本地正则
+python main.py -u urls.txt --domains example.com --no-llm
+
+# JSON 也送 LLM 审计
+python main.py -u urls.txt --domains example.com --audit-json
 ```
 
-整个过程全自动，你只需要提供 URL 和域名白名单，等报告出来就行。如果追求最高覆盖率，建议安装 Playwright 并将 `render_mode` 设为 `full`。
+### 下载模式
 
+只递归下载前端资源到本地，不审计、不调 LLM、不探测接口。递归引擎与审计模式一致。
 
-## 九、使用方法
+```bash
+python main.py --download -u https://target.example.com/ --domains target.example.com -o ./dump
 
+# 批量下载
+python main.py --download -u targets.txt --domains example.com -o ./dump -d 3
 ```
-在config.yaml文件中配置大模型的id和key，然后使用命令行python ./web.py 即可打开web ui界面
+
+下载目录结构按 `输出目录/域名/URL路径` 保存。
+
+### 参数表
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `-u` / `--urls` | 必填 | URL 清单文件或单个 URL |
+| `-c` / `--config` | `config.yaml` | 配置文件路径 |
+| `-d` / `--depth` | 配置值 | 覆盖递归深度 |
+| `--domains` | 配置值 | 覆盖域名白名单，逗号分隔 |
+| `--no-llm` | 关 | 关闭 LLM，仅本地正则 |
+| `--audit-json` | 关 | JSON 内容也送 LLM 审计 |
+| `--download` | 关 | 下载模式 |
+| `-o` / `--output` | `downloads` | 下载模式输出目录 |
+| `-v` / `--verbose` | 关 | 输出 DEBUG 日志 |
+
+## Web UI 用法
+
+```bash
+python webui.py            # 默认 http://127.0.0.1:8000
+python webui.py -p 9000
 ```
+
+在页面填写授权扫描清单（每行一个 URL）和域名白名单，调整深度、并发、QPS，勾选是否启用 LLM、是否对 JSON 送 LLM、是否启用代理，然后点击开始。运行中可实时改并发/深度并应用，无需重跑。完成后可下载 `report.md` 和 `full.json`。
+
+`audit_json` 开关仅在勾选「启用 DeepSeek 审计」时可用；未配置 API Key 时自动禁用。
+
+## 递归 vs 目录爆破
+
+工具采用递归爬取：只下载页面代码里实际引用的资源。它能覆盖带 hash 的动态文件名（如 `chunk-2d0a3b4c.js`）；目录爆破靠字典猜路径，无法命中这类文件名，且产生大量 404 噪声。
+
+## 输出报告
+
+每次扫描在 `reports/<时间戳>/` 下生成：
+
+- `report.md`：敏感信息表、接口探测表、节点明细。
+- `full.json`：全量结构化数据。
+
+## 注意事项
+
+- 仅用于自有资产或已获书面授权的目标，遵守当地法律法规。
+- 必须配置授权域名白名单，否则拒绝运行。
+- QPS 根据目标承受能力调整，避免触发 WAF 或封禁。

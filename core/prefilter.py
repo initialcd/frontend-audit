@@ -86,6 +86,12 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern]] = [
 
 # ---------- 版本信息 ----------
 # 每条规则的第一捕获组必须是版本号本身（_iter_hits 统一取 group(1)）。
+# 前端库名列表统一维护：新增库只改这一处，三条指纹正则自动同步。
+_LIB_NAMES = (
+    r"jquery|vue(?:\.min)?|react(?:-dom)?|angular(?:js)?|bootstrap|lodash|moment|"
+    r"axios|echarts|element-ui|element-plus|antd|d3|three|layui|swiper"
+)
+
 VERSION_PATTERNS: list[tuple[str, re.Pattern]] = [
     # 1) 赋值/JSON：version / appVersion / build_version / release 等，值可带 v 前缀、可无引号
     (
@@ -97,9 +103,7 @@ VERSION_PATTERNS: list[tuple[str, re.Pattern]] = [
     # 2) 库指纹 / CDN 路径：jquery/3.6.0、jquery-3.6.0.min.js、vue@2.6.14（点分结构，避免吃到 .min.js）
     (
         "lib_fingerprint",
-        re.compile(
-            r"""(?i)(?:jquery|vue(?:\.min)?|react(?:-dom)?|angular(?:js)?|bootstrap|lodash|moment|axios|echarts|element-ui|element-plus|antd|d3|three|layui|swiper)[./@-]v?(\d+(?:\.\d+){0,3})"""
-        ),
+        re.compile(rf"""(?i)(?:{_LIB_NAMES})[./@-]v?(\d+(?:\.\d+){{0,3}})"""),
     ),
     # 3) JSDoc / 注释标注：@version 1.2.3
     (
@@ -121,16 +125,12 @@ VERSION_PATTERNS: list[tuple[str, re.Pattern]] = [
     # 6) 库版权注释：/*! jQuery v3.6.0 | ... */
     (
         "lib_comment",
-        re.compile(
-            r"""(?i)(?:jquery|vue|react(?:-dom)?|angular(?:js)?|bootstrap|lodash|moment|axios|echarts|element-ui|element-plus|antd|d3|three|layui|swiper)\s+v?(\d[\w.\-]{0,12})"""
-        ),
+        re.compile(rf"""(?i)(?:{_LIB_NAMES})\s+v?(\d[\w.\-]{{0,12}})"""),
     ),
     # 7) 依赖声明：package.json 风格 "lodash": "^4.17.21"
     (
         "dep_decl",
-        re.compile(
-            r"""(?i)["'](?:jquery|vue|react(?:-dom)?|angular(?:js)?|bootstrap|lodash|moment|axios|echarts|element-ui|element-plus|antd|d3|three|layui|swiper)["']\s*:\s*["'](?:[\^~]|>=?|<=?)?v?(\d[\w.\-]{0,12})"""
-        ),
+        re.compile(rf"""(?i)["'](?:{_LIB_NAMES})["']\s*:\s*["'](?:[\^~]|>=?|<=?)?v?(\d[\w.\-]{{0,12}})"""),
     ),
 ]
 
@@ -210,7 +210,78 @@ def _build_snippets(text: str, hits: list[tuple[int, int]], ctx: int, cap: int) 
     return "\n\n-----\n\n".join(parts)
 
 
-def prefilter_js(text: str, context: int = 100, cap: int = 12000) -> PrefilterResult:
+def _scan_segment(
+    text: str, context: int, skip_start: int | None = None
+) -> tuple[list[LocalFinding], list[tuple[int, int]]]:
+    """扫描单块文本的密钥 + 版本，返回 (findings, 命中偏移)。
+
+    skip_start：块内偏移，>= 该偏移的命中跳过（分块时交给下一块重叠区处理，避免重复）。
+    """
+    findings: list[LocalFinding] = []
+    hits: list[tuple[int, int]] = []
+    for name, severity, pattern in SECRET_PATTERNS:
+        for start, end, value in _iter_hits(pattern, text):
+            if skip_start is not None and start >= skip_start:
+                continue
+            conf = 0.9 if name in ("generic_secret", "jwt") else 0.95
+            findings.append(LocalFinding(
+                name, severity, value, _context(text, start, end, context), conf, "本地正则命中"
+            ))
+            hits.append((start, end))
+    for name, pattern in VERSION_PATTERNS:
+        for start, end, value in _iter_hits(pattern, text):
+            if skip_start is not None and start >= skip_start:
+                continue
+            findings.append(LocalFinding(
+                "version", "low", value, _context(text, start, end, context), 0.7, name
+            ))
+            hits.append((start, end))
+    return findings, hits
+
+
+def _scan_patterns(text: str, context: int, cap: int) -> tuple[list[LocalFinding], str]:
+    """整块扫描密钥 + 版本，返回 (findings, snippets)。"""
+    findings, hits = _scan_segment(text, context)
+    return findings, _build_snippets(text, hits, context, cap)
+
+
+def _scan_chunked(
+    text: str, context: int, cap: int, chunk_size: int
+) -> tuple[list[LocalFinding], str]:
+    """大文本按块扫描密钥 + 版本：块间带重叠避免边界漏报，命中不重复。"""
+    if len(text) <= chunk_size:
+        return _scan_patterns(text, context, cap)
+    overlap = context * 2 + 512
+    if overlap >= chunk_size:
+        overlap = chunk_size // 4
+    findings: list[LocalFinding] = []
+    parts: list[str] = []
+    used = 0
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        seg = text[start:end]
+        last = end >= len(text)
+        skip_start = None if last else max(0, len(seg) - overlap)
+        seg_findings, hits = _scan_segment(seg, context, skip_start)
+        findings.extend(seg_findings)
+        if used < cap:
+            s = _build_snippets(seg, hits, context, cap)
+            if s:
+                remaining = cap - used
+                if len(s) > remaining:
+                    s = s[:remaining]
+                parts.append(s)
+                used += len(s) + 4
+        if last:
+            break
+        start = end - overlap
+    return findings, "\n\n-----\n\n".join(parts)
+
+
+def prefilter_js(
+    text: str, context: int = 100, cap: int = 12000, chunk_kb: int | None = None
+) -> PrefilterResult:
     res = PrefilterResult()
     m = SOURCE_MAP_RE.search(text)
     if m:
@@ -226,25 +297,16 @@ def prefilter_js(text: str, context: int = 100, cap: int = 12000) -> PrefilterRe
         if s and s not in res.api_paths:
             res.api_paths.append(s)
 
-    hits: list[tuple[int, int]] = []
-    for name, severity, pattern in SECRET_PATTERNS:
-        for start, end, value in _iter_hits(pattern, text):
-            conf = 0.9 if name in ("generic_secret", "jwt") else 0.95
-            res.findings.append(LocalFinding(
-                name, severity, value, _context(text, start, end, context), conf, "本地正则命中"
-            ))
-            hits.append((start, end))
-    for name, pattern in VERSION_PATTERNS:
-        for start, end, value in _iter_hits(pattern, text):
-            res.findings.append(LocalFinding(
-                "version", "low", value, _context(text, start, end, context), 0.7, name
-            ))
-            hits.append((start, end))
-    res.snippets = _build_snippets(text, hits, context, cap)
+    if chunk_kb and chunk_kb > 0:
+        res.findings, res.snippets = _scan_chunked(text, context, cap, chunk_kb * 1024)
+    else:
+        res.findings, res.snippets = _scan_patterns(text, context, cap)
     return res
 
 
-def prefilter_text(text: str, context: int = 100, cap: int = 12000) -> PrefilterResult:
+def prefilter_text(
+    text: str, context: int = 100, cap: int = 12000, chunk_kb: int | None = None
+) -> PrefilterResult:
     """对 JSON / 内联脚本等非 JS 文本做轻量扫描：路径 + 密钥 + 版本（不进 LLM）。"""
     res = PrefilterResult()
     for m in API_ABSOLUTE_RE.finditer(text):
@@ -253,19 +315,8 @@ def prefilter_text(text: str, context: int = 100, cap: int = 12000) -> Prefilter
         s = m.group(1)
         if s and s not in res.api_paths:
             res.api_paths.append(s)
-    hits: list[tuple[int, int]] = []
-    for name, severity, pattern in SECRET_PATTERNS:
-        for start, end, value in _iter_hits(pattern, text):
-            conf = 0.9 if name in ("generic_secret", "jwt") else 0.95
-            res.findings.append(LocalFinding(
-                name, severity, value, _context(text, start, end, context), conf, "本地正则命中"
-            ))
-            hits.append((start, end))
-    for name, pattern in VERSION_PATTERNS:
-        for start, end, value in _iter_hits(pattern, text):
-            res.findings.append(LocalFinding(
-                "version", "low", value, _context(text, start, end, context), 0.7, name
-            ))
-            hits.append((start, end))
-    res.snippets = _build_snippets(text, hits, context, cap)
+    if chunk_kb and chunk_kb > 0:
+        res.findings, res.snippets = _scan_chunked(text, context, cap, chunk_kb * 1024)
+    else:
+        res.findings, res.snippets = _scan_patterns(text, context, cap)
     return res

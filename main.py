@@ -26,6 +26,7 @@ from core.config import Config
 from core.dedup import Dedup
 from core.fetcher import Fetcher
 from core.normalizer import (
+    content_hash,
     host_of,
     is_in_scope,
     is_static_asset,
@@ -50,6 +51,8 @@ def parse_args() -> argparse.Namespace:
                    help="覆盖授权域名白名单，逗号分隔（如 example.com,a.example.com）")
     p.add_argument("--no-llm", action="store_true",
                    help="关闭 DeepSeek 审计，仅本地正则")
+    p.add_argument("--audit-json", action="store_true",
+                   help="对 JSON 内容也启用 LLM 语义审计（默认关闭，省 token）")
     p.add_argument("--download", action="store_true",
                    help="下载模式：递归爬取前端资源并存盘，不审计")
     p.add_argument("-o", "--output", default="downloads",
@@ -81,6 +84,8 @@ async def amain(args: argparse.Namespace) -> int:
         cfg.scope.domains = [d.strip() for d in args.domains.split(",") if d.strip()]
     if args.no_llm:
         cfg.scan.llm_enabled = False
+    if args.audit_json:
+        cfg.scan.audit_json = True
 
     # 安全约束：无授权白名单则拒绝运行
     if not cfg.scope.domains:
@@ -147,6 +152,10 @@ def _url_to_filepath(url: str, output_dir: Path, content_type: str) -> Path:
             fp = fp.with_suffix(".css")
         else:
             fp = fp.with_suffix(".html")
+    # 路径穿越防护：解码后的 .. 会被 resolve() 展开，校验是否仍在输出目录内
+    base = output_dir.resolve()
+    if not fp.resolve().is_relative_to(base):
+        raise ValueError(f"拒绝写出输出目录之外：{url} -> {fp}")
     return fp
 
 
@@ -178,11 +187,16 @@ async def download_mode(args: argparse.Namespace) -> int:
 
     proxy_pool = ProxyPool(cfg)
     fetcher = Fetcher(cfg, proxy_pool)
+    store = Store(cfg.storage.db_path)
     dedup = Dedup()
+    # 断点续跑：载入历史 URL 与内容哈希，避免重跑从头再来、避免相同内容重复写盘
+    dedup.seen_urls |= await store.load_seen_urls()
+    dedup.audited_contents |= await store.load_seen_content_hashes()
 
     print(f"[*] 下载模式：种子 {len(seeds)} 个，深度 {cfg.scan.max_depth}，"
           f"并发 {cfg.scan.concurrency}，输出目录 {output_dir.resolve()}")
     print(f"[*] 授权域名白名单：{cfg.scope.domains}")
+    print(f"[*] 断点续跑：已加载 {len(dedup.seen_urls)} 条历史 URL、{len(dedup.audited_contents)} 条内容记录")
 
     downloaded = 0
     failed = 0
@@ -198,6 +212,9 @@ async def download_mode(args: argparse.Namespace) -> int:
         nonlocal downloaded, failed, skipped
         while True:
             url, depth = await queue.get()
+            if depth < 0:  # 哨兵信号，退出
+                queue.task_done()
+                return
             try:
                 canonical = normalize_url(url)
                 if is_static_asset(canonical, cfg.scan.excluded_extensions):
@@ -218,7 +235,29 @@ async def download_mode(args: argparse.Namespace) -> int:
                     failed += 1
                     continue
 
-                filepath = _url_to_filepath(fr.final_url, output_dir, fr.content_type)
+                kind = fetcher.classify(fr)
+                ch = content_hash(fr.body)
+
+                # 持久化 URL 记录（断点续跑）：即使内容重复也标记已处理
+                await store.save_url({
+                    "url_hash": h, "url": canonical, "final_url": fr.final_url,
+                    "status": fr.status, "content_type": fr.content_type, "size": fr.size,
+                    "depth": depth, "kind": kind, "source": "download", "content_hash": ch,
+                })
+
+                # 内容去重：不同 query 的相同内容（app.js?v=1 / app.js?v=2）只写盘一次
+                if dedup.seen_content(ch):
+                    skipped += 1
+                    logger.debug("内容重复跳过 %s", url)
+                    continue
+                dedup.mark_content(ch)
+
+                try:
+                    filepath = _url_to_filepath(fr.final_url, output_dir, fr.content_type)
+                except ValueError as exc:
+                    logger.warning("跳过非法路径 %s：%s", url, exc)
+                    skipped += 1
+                    continue
                 filepath.parent.mkdir(parents=True, exist_ok=True)
                 filepath.write_bytes(fr.body)
 
@@ -265,6 +304,7 @@ async def download_mode(args: argparse.Namespace) -> int:
     await asyncio.gather(*workers, return_exceptions=True)
 
     await fetcher.close()
+    store.close()
 
     print(f"\n===== 下载完成 =====")
     print(f"成功：{downloaded}，失败：{failed}，跳过（重复/白名单外/静态资源）：{skipped}")

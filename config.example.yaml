@@ -20,10 +20,13 @@ scan:
   max_nodes_per_domain: 2000     # 每域节点上限
   max_total_nodes: 10000         # 全局节点上限
   max_method_probes: 3000        # OPTIONS/POST 探测总次数上限
-  max_asset_kb: 2048             # 超过该大小的响应只记录不下载
+  max_body_kb: 51200             # 响应体硬上限：仅超过该大小才丢弃（默认 50MB，保护内存）
+  chunk_scan_kb: 2048            # 大文本分段扫描块大小（KB，超过则分块 prefilter）
   snippet_context: 100           # 正则命中前后各取多少字符送 LLM
   llm_snippet_cap: 12000         # 每次送 LLM 的片段总字符上限
   llm_enabled: true              # 关掉则纯本地正则模式（--no-llm 同效）
+  llm_full_audit: false          # 全量片段送 LLM：对无正则命中但可能有语义漏洞的 JS 也送全文片段
+  llm_full_audit_domains: []     # 特定域名白名单：命中这些域名时全量片段送 LLM
   verify_tls: true
   render_enabled: true           # 启用 Playwright 渲染（需装 playwright）
   render_mode: "hybrid"          # off=纯httpx / hybrid=仅SPA空壳启用 / full=全部HTML启用

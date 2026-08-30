@@ -70,6 +70,15 @@ class Store:
     async def load_seen_urls(self) -> set[str]:
         return await self._run(self._load_seen_urls)
 
+    def _load_seen_content_hashes(self) -> set[str]:
+        cur = self.conn.execute(
+            "SELECT DISTINCT content_hash FROM urls WHERE content_hash IS NOT NULL AND content_hash != ''"
+        )
+        return {r[0] for r in cur.fetchall()}
+
+    async def load_seen_content_hashes(self) -> set[str]:
+        return await self._run(self._load_seen_content_hashes)
+
     # ---------- endpoints ----------
     def _insert_endpoint(self, row: dict) -> None:
         with self.conn:

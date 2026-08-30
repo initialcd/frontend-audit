@@ -25,10 +25,16 @@ class ScanConfig(BaseModel):
     max_nodes_per_domain: int = 2000
     max_total_nodes: int = 10000
     max_method_probes: int = 3000
-    max_asset_kb: int = 2048
+    max_body_kb: int = 51200           # 响应体硬上限：仅超过该大小才丢弃（默认 50MB，保护内存）
+    chunk_scan_kb: int = 2048          # 大文本分段扫描块大小（KB，按字符近似，超过则分块 prefilter）
     snippet_context: int = 100
     llm_snippet_cap: int = 12000
     llm_enabled: bool = True
+    audit_json: bool = False           # 是否对 JSON 内容也送 LLM 审计（默认关，省 token）
+    llm_full_audit: bool = False       # 全量片段送 LLM 开关：对无正则命中但可能有语义漏洞的 JS 也送全文片段
+    llm_full_audit_domains: list[str] = Field(
+        default_factory=list          # 特定域名白名单：命中这些域名时全量片段送 LLM
+    )
     verify_tls: bool = True
     render_enabled: bool = True         # 启用 Playwright 渲染
     render_mode: str = "hybrid"         # off=纯httpx / hybrid=仅SPA空壳启用 / full=全部HTML启用增强渲染

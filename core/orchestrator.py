@@ -305,7 +305,8 @@ class Orchestrator:
             if target:
                 await self._enqueue(target, depth + 1, fr.url)
         for code in inline:
-            pf = prefilter_text(code, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap)
+            pf = prefilter_text(code, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap,
+                                self.cfg.scan.chunk_scan_kb)
             await self._record_local(fr.url, pf, depth)
 
         # 增强渲染（三种模式）
@@ -352,7 +353,8 @@ class Orchestrator:
 
     async def _handle_js(self, fr, depth: int) -> None:
         text = decode(fr.body)
-        pf = prefilter_js(text, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap)
+        pf = prefilter_js(text, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap,
+                          self.cfg.scan.chunk_scan_kb)
 
         # sourcemap：记录泄露 + 尝试抓取（.map 内容本身有价值）
         if pf.source_map:
@@ -371,26 +373,46 @@ class Orchestrator:
                 await self._enqueue(target, depth + 1, fr.url)
 
         await self._record_local(fr.url, pf, depth)
-
-        # LLM 审计（内容级去重：不同 URL 返回相同 JS 只审计一次）
-        if pf.snippets and self.cfg.scan.llm_enabled and self.auditor.available():
-            ch = content_hash(fr.body)
-            if self.dedup.seen_content(ch):
-                logger.debug("内容重复，跳过 LLM：%s", fr.url)
-                return
-            self.dedup.mark_content(ch)
-            self.summary.llm_calls += 1
-            result = await self.auditor.audit(fr.url, pf.snippets)
-            if result is None:
-                self.summary.llm_failures += 1
-                return
-            await self._record_llm(fr.url, result, depth)
+        await self._llm_audit(fr, pf, depth)
 
     async def _handle_json(self, fr, depth: int) -> None:
-        # JSON 不做代码审计，只做零成本本地扫描 + 接口记录
+        # JSON 默认只做本地扫描 + 接口记录；开启 audit_json 后才送 LLM 语义审计
         text = decode(fr.body)
-        pf = prefilter_text(text, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap)
+        pf = prefilter_text(text, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap,
+                            self.cfg.scan.chunk_scan_kb)
         await self._record_local(fr.url, pf, depth)
+        if self.cfg.scan.audit_json:
+            await self._llm_audit(fr, pf, depth)
+
+    def _llm_full_enabled(self, url: str) -> bool:
+        """是否对无正则命中的内容也送全量片段：全局开关或域名白名单命中。"""
+        if self.cfg.scan.llm_full_audit:
+            return True
+        domain = host_of(url)
+        return bool(domain and domain in self.cfg.scan.llm_full_audit_domains)
+
+    async def _llm_audit(self, fr, pf: PrefilterResult, depth: int) -> None:
+        # LLM 审计（内容级去重：不同 URL 返回相同内容只审计一次）
+        if not (self.cfg.scan.llm_enabled and self.auditor.available()):
+            return
+        # 默认只送正则命中片段（token 漏斗）；开启全量开关或域名命中白名单时，
+        # 对无正则命中但可能存在语义漏洞的内容（越权、加密误用、硬编码业务逻辑）送全文片段。
+        snippet = pf.snippets
+        if not snippet and self._llm_full_enabled(fr.url) and fr.body:
+            snippet = decode(fr.body)[: self.cfg.scan.llm_snippet_cap]
+        if not snippet:
+            return
+        ch = content_hash(fr.body)
+        if self.dedup.seen_content(ch):
+            logger.debug("内容重复，跳过 LLM：%s", fr.url)
+            return
+        self.dedup.mark_content(ch)
+        self.summary.llm_calls += 1
+        result = await self.auditor.audit(fr.url, snippet)
+        if result is None:
+            self.summary.llm_failures += 1
+            return
+        await self._record_llm(fr.url, result, depth)
 
     # ---------- 结果记录与递归 ----------
     async def _record_local(self, source: str, pf: PrefilterResult, depth: int) -> None:
