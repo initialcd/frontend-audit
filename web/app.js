@@ -22,12 +22,17 @@ async function init() {
       $("llm").disabled = true;
       $("llm").title = "未配置 DEEPSEEK_API_KEY，请在 config.yaml 设置";
     }
+    syncAuditJson();
     const proxyBadge = $("badge-proxy");
     proxyBadge.textContent = "代理: " + (cfg.proxy_enabled ? "开" : "关");
     proxyBadge.className = "badge " + (cfg.proxy_enabled ? "on" : "off");
   } catch (e) {
     setStatus("加载配置失败：" + e, true);
   }
+}
+
+function syncAuditJson() {
+  $("audit_json").disabled = $("llm").disabled || !$("llm").checked;
 }
 
 // ---------- 标签切换 ----------
@@ -39,6 +44,9 @@ document.querySelectorAll(".tab").forEach((t) =>
     $("tab-" + t.dataset.tab).classList.add("active");
   })
 );
+
+// ---------- LLM 开关联动 JSON 审计 ----------
+$("llm").addEventListener("change", syncAuditJson);
 
 // ---------- 从种子提取域名 ----------
 $("extract-domains").addEventListener("click", () => {
@@ -68,6 +76,7 @@ $("start").addEventListener("click", async () => {
     concurrency: parseInt($("concurrency").value, 10),
     qps: parseFloat($("qps").value),
     llm: $("llm").checked,
+    audit_json: $("audit_json").checked,
     proxy: $("proxy").checked,
     render_mode: $("render_mode").value,
   };

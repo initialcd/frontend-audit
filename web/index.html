@@ -58,6 +58,12 @@
       </div>
       <div class="form-row">
         <div class="check">
+          <input type="checkbox" id="audit_json">
+          <label for="audit_json" style="margin:0">JSON 内容也送 LLM 审计（默认关，省 token）</label>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="check">
           <input type="checkbox" id="proxy">
           <label for="proxy" style="margin:0">启用代理池（走 config.yaml 中配置的代理）</label>
         </div>

@@ -381,6 +381,7 @@ class Handler(BaseHTTPRequestHandler):
             "per_domain_qps": cfg.scan.per_domain_qps,
             "llm_enabled": cfg.scan.llm_enabled,
             "llm_available": bool(cfg.resolve_api_key()),
+            "audit_json": cfg.scan.audit_json,
             "proxy_enabled": cfg.proxy.enabled,
             "render_mode": cfg.scan.render_mode,
         }
