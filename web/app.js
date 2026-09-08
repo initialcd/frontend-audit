@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 let pollTimer = null;
 let startedAt = null;
 let currentStatus = "idle";
+let lastLiveLoad = 0; // 运行中结果表刷新的节流时间戳（2s 一次，避免大表高频重建）
 
 // ---------- 初始化 ----------
 async function init() {
@@ -11,6 +12,7 @@ async function init() {
     $("concurrency").value = cfg.concurrency;
     $("qps").value = cfg.per_domain_qps;
     $("llm").checked = cfg.llm_enabled && cfg.llm_available;
+    $("audit_json").checked = !!cfg.audit_json;
     $("proxy").checked = cfg.proxy_enabled;
     $("render_mode").value = cfg.render_mode || "hybrid";
     $("live-concurrency").value = cfg.concurrency;
@@ -163,12 +165,27 @@ async function poll() {
       log.textContent = s.logs.join("\n");
       log.scrollTop = log.scrollHeight;
     }
+    // 选项卡计数：发现/接口/节点 实时显示条数
+    setTabCount("findings", s.findings ?? 0);
+    setTabCount("endpoints", s.endpoints ?? 0);
+    setTabCount("nodes", s.total_nodes ?? 0);
+
+    // 动态结果：运行中（含暂停/取消中）每 2s 渐进刷新结果表，
+    // 完成后强制再全量刷新一次，杜绝"只有任务结束才有内容"。
+    const active = s.status === "running" || s.status === "paused" || s.status === "cancelling";
+    const terminal = s.status === "done" || s.status === "error" || s.status === "cancelled";
+    if (active || terminal) {
+      const now = Date.now();
+      if (terminal || now - lastLiveLoad >= 2000) {
+        lastLiveLoad = now;
+        await loadResults();
+      }
+    }
     setStatus(statusText(s.status));
     updateControls(s.status);
-    if (s.status === "done" || s.status === "error" || s.status === "cancelled") {
+    if (terminal) {
       clearInterval(pollTimer);
       pollTimer = null;
-      await loadResults();
       if (s.status === "done") switchTab("findings");
     }
   } catch (e) {
@@ -222,21 +239,18 @@ function renderFindings(rows) {
 function renderEndpoints(rows) {
   const tb = $("tb-endpoints");
   if (!rows.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">无接口</td></tr>'; return; }
-  // 按 url 聚合各方法状态
+  // 按 url 聚合各方法状态；同时预建 url→cors 映射，避免 O(n²) 查找
   const byUrl = {};
+  const corsMap = {};
   for (const r of rows) {
     (byUrl[r.url] = byUrl[r.url] || {})[(r.method || "").toUpperCase()] = r.status;
+    if (r.cors) corsMap[r.url] = r.cors;
   }
   tb.innerHTML = Object.entries(byUrl).map(([url, m]) =>
     `<tr><td>${esc(trunc(url, 90))}</td>
      <td>${cell(m.GET)}</td><td>${cell(m.OPTIONS)}</td><td>${cell(m.POST)}</td>
-     <td>${esc(trunc(r_cors(rows, url), 30))}</td></tr>`
+     <td>${esc(trunc(corsMap[url] || "", 30))}</td></tr>`
   ).join("");
-}
-
-function r_cors(rows, url) {
-  const r = rows.find((x) => x.url === url);
-  return r ? r.cors : "";
 }
 function cell(v) {
   if (v === undefined || v === null) return '<span class="muted">-</span>';
@@ -294,6 +308,13 @@ function setStatus(text, isError) {
 }
 function switchTab(name) {
   document.querySelector(`.tab[data-tab="${name}"]`).click();
+}
+const TAB_LABELS = { progress: "进度", findings: "发现", endpoints: "接口", nodes: "节点" };
+function setTabCount(name, n) {
+  const t = document.querySelector(`.tab[data-tab="${name}"]`);
+  if (!t) return;
+  const label = TAB_LABELS[name] || name;
+  t.textContent = n > 0 ? `${label} (${n})` : label;
 }
 function esc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function trunc(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + "…" : s; }

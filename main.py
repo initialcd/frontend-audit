@@ -31,6 +31,7 @@ from core.normalizer import (
     is_in_scope,
     is_static_asset,
     normalize_url,
+    parse_domains,
     resolve_url,
     url_hash,
 )
@@ -42,7 +43,7 @@ from storage.reporter import write_reports
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="前端代码敏感信息审计 + API 递归发现 + 前端资源下载")
+    p = argparse.ArgumentParser(description="前端代码敏感信息审计 + API 递归发现 + 前端资源下载 by inicd")
     p.add_argument("-u", "--urls", required=True,
                    help="URL 列表文件或单个 URL（http(s) 开头）")
     p.add_argument("-c", "--config", default="config.yaml", help="配置文件路径")
@@ -81,7 +82,7 @@ async def amain(args: argparse.Namespace) -> int:
     if args.depth is not None:
         cfg.scan.max_depth = args.depth
     if args.domains:
-        cfg.scope.domains = [d.strip() for d in args.domains.split(",") if d.strip()]
+        cfg.scope.domains = parse_domains(args.domains)
     if args.no_llm:
         cfg.scan.llm_enabled = False
     if args.audit_json:
@@ -165,7 +166,7 @@ async def download_mode(args: argparse.Namespace) -> int:
     if args.depth is not None:
         cfg.scan.max_depth = args.depth
     if args.domains:
-        cfg.scope.domains = [d.strip() for d in args.domains.split(",") if d.strip()]
+        cfg.scope.domains = parse_domains(args.domains)
 
     if not cfg.scope.domains:
         print(

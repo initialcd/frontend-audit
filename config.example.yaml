@@ -1,23 +1,22 @@
-# ============================================================
-# 前端代码审计工具 - 配置模板
-# 使用方法: 复制本文件为 config.yaml，填入你的配置
-#           cp config.example.yaml config.yaml
-# ============================================================
+# 前端代码审计工具配置模板
+# 复制为 config.yaml 后按需修改；不要提交真实密钥。
+# DeepSeek API Key 也可通过环境变量 DEEPSEEK_API_KEY 提供，避免写入文件。
 
 deepseek:
-  api_key: ""                    # DeepSeek API Key（或设置环境变量 DEEPSEEK_API_KEY）
-  base_url: "https://api.deepseek.com"
-  model: "deepseek-v4-flash"    # deepseek-v4-flash（快速）/ deepseek-v4-pro（推理强）
-  temperature: 0
+  api_key: ""                    # 留空则读取环境变量 DEEPSEEK_API_KEY
+  base_url: "https://api.deepseek.com"   # 官方 API；用中转站填中转地址
+  model: "deepseek-chat"
+  temperature: 0                 # 审计任务保持 0，输出更稳定
   max_tokens: 4096
 
 scan:
-  concurrency: 20                # 全局异步并发
+  concurrency: 20                # 全局异步并发（调高会更快但更易触发 WAF/封 IP）
   per_domain_qps: 5              # 每域每秒请求上限（防封 IP）
+  qps_jitter: 0.2                # 每域限速抖动比例：±20% 随机化请求节奏，降低被 WAF 识别的概率
   timeout: 15                    # 单请求超时（秒）
   retries: 2                     # 失败重试次数
   max_depth: 5                   # 递归深度上限（种子为 0）
-  max_nodes_per_domain: 2000     # 每域节点上限
+  max_nodes_per_domain: 2000     # 每个主域名分组（含子域）的节点上限
   max_total_nodes: 10000         # 全局节点上限
   max_method_probes: 3000        # OPTIONS/POST 探测总次数上限
   max_body_kb: 51200             # 响应体硬上限：仅超过该大小才丢弃（默认 50MB，保护内存）
@@ -25,11 +24,12 @@ scan:
   snippet_context: 100           # 正则命中前后各取多少字符送 LLM
   llm_snippet_cap: 12000         # 每次送 LLM 的片段总字符上限
   llm_enabled: true              # 关掉则纯本地正则模式（--no-llm 同效）
+  audit_json: false              # JSON 内容是否也送 LLM 审计（默认关，省 token）
   llm_full_audit: false          # 全量片段送 LLM：对无正则命中但可能有语义漏洞的 JS 也送全文片段
-  llm_full_audit_domains: []     # 特定域名白名单：命中这些域名时全量片段送 LLM
+  llm_full_audit_domains: []     # 特定域名白名单：命中则全量片段送 LLM
   verify_tls: true
   render_enabled: true           # 启用 Playwright 渲染（需装 playwright）
-  render_mode: "hybrid"          # off=纯httpx / hybrid=仅SPA空壳启用 / full=全部HTML启用
+  render_mode: "hybrid"          # off=纯httpx / hybrid=仅SPA空壳启用增强渲染 / full=全部HTML启用增强渲染
   render_max_clicks: 30          # 渲染时最多点击多少个元素触发懒加载
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   allowed_content_types:
@@ -41,9 +41,9 @@ scan:
     - "text/ecmascript"
     - "application/json"
     - "text/json"
-    - "text/plain"
+    - "text/plain"               # 配合路径后缀嗅探（.js 会按 JS 处理）
     - "application/octet-stream"
-  excluded_extensions:
+  excluded_extensions:           # 静态资源不参与抓取/审计
     - ".png"
     - ".jpg"
     - ".jpeg"
@@ -67,20 +67,25 @@ scan:
     - ".xls"
 
 scope:
-  domains: []                    # 【必填】授权域名白名单，如 ["example.com"]
-  allow_subdomains: true
+  # 【必填】授权域名白名单。递归永远出不了这个范围。空则拒绝运行。
+  # 支持多个主域名并存，逗号/全角逗号/换行分隔均可；自动清洗协议/端口/大小写。
+  # 每个主域名（含其子域）的资产独立分组，按 max_nodes_per_domain 独立配额，互不挤占。
+  domains: []
+  allow_subdomains: true         # false = 严格同域（子域不再自动纳入白名单）
 
 proxy:
   enabled: false
-  mode: "local"                  # local | api
+  # local：固定本地 HTTP 代理端口（如 TscanPlus 代理池入口）
+  # api：定时从代理池 API 拉取列表并轮询
+  mode: "local"
   local_url: "http://127.0.0.1:8080"
   api_url: ""
   api_key: ""
   refresh_seconds: 300
 
 methods:
-  probe: ["OPTIONS", "POST"]
-  dangerous_patterns:
+  probe: ["OPTIONS", "POST"]     # GET 状态由抓取阶段记录
+  dangerous_patterns:            # POST 有副作用，命中这些词的路径跳过 POST
     - "delete"
     - "remove"
     - "upload"
@@ -92,5 +97,5 @@ methods:
     - "deactivate"
 
 storage:
-  db_path: "state.db"
+  db_path: "state.db"            # 断点续跑状态（自动复用）
   output_dir: "reports"

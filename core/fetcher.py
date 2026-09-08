@@ -2,11 +2,15 @@
 
 这里实现的就是"递归阶段的廉价预检"——在消耗 token 之前，
 先判断响应是否值得下载和审计（替代独立的 httpx 存活探测流程）。
+探测方式：每次抓取即为"预检"（状态码 2xx/3xx + Content-Type 白名单 + 响应体大小上限 + 重试 + 每域 QPS 限速）；
+非 2xx/3xx 不读 body，死链零成本跳过。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import ssl
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
@@ -39,11 +43,24 @@ class FetchResult:
     error: str = ""
 
 
-class RateLimiter:
-    """按域名的最小间隔限速（token bucket 简化版）。"""
+def _default_ssl_context() -> ssl.SSLContext:
+    """创建默认 SSL context，并允许旧式 TLS 重协商。
 
-    def __init__(self, qps: float):
+    部分银行/政企站点仍使用旧式 TLS 重协商（legacy renegotiation），
+    Python 3.12+ 默认禁用会导致握手失败（UNSAFE_LEGACY_RENEGOTIATION_DISABLED）。
+    """
+    ctx = ssl.create_default_context()
+    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+    return ctx
+
+
+class RateLimiter:
+    """按域名的最小间隔限速（token bucket 简化版），带抖动以打散请求节奏。"""
+
+    def __init__(self, qps: float, jitter: float = 0.2):
         self.qps = qps
+        self.jitter = max(0.0, min(jitter, 1.0))
         self._next: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
@@ -58,18 +75,24 @@ class RateLimiter:
             self._next[domain] = t + interval
             delay = t - now
         if delay > 0:
-            await asyncio.sleep(delay)
+            # 抖动：实际等待时间按 ±jitter 比例随机化，把固定间隔打散为
+            # 不规则节奏，降低被 WAF 按固定节拍识别为"自动化工具"的概率。
+            j = 1.0 + random.uniform(-self.jitter, self.jitter)
+            await asyncio.sleep(max(0.0, delay * j))
 
 
 class Fetcher:
     def __init__(self, cfg: Config, proxy_pool: ProxyPool):
         self.cfg = cfg.scan
         self.proxy_pool = proxy_pool
-        self.limiter = RateLimiter(cfg.scan.per_domain_qps)
+        self.limiter = RateLimiter(cfg.scan.per_domain_qps, cfg.scan.qps_jitter)
+        verify = cfg.scan.verify_tls
+        if verify is True:
+            verify = _default_ssl_context()
         self.client = httpx.AsyncClient(
             timeout=cfg.scan.timeout,
             follow_redirects=True,
-            verify=cfg.scan.verify_tls,
+            verify=verify,
             headers={
                 "User-Agent": cfg.scan.user_agent,
                 "Accept": (

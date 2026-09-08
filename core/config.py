@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 class DeepSeekConfig(BaseModel):
     api_key: str = ""
     base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-chat"
     temperature: float = 0.0
     max_tokens: int = 4096
 
@@ -19,6 +19,7 @@ class DeepSeekConfig(BaseModel):
 class ScanConfig(BaseModel):
     concurrency: int = 20
     per_domain_qps: float = 5.0
+    qps_jitter: float = 0.2            # 每域限速抖动比例：把固定间隔打散成 ±jitter，降低被 WAF 按节奏识别的概率
     timeout: float = 15.0
     retries: int = 2
     max_depth: int = 5

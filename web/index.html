@@ -26,12 +26,12 @@
       </div>
 
       <div class="form-row">
-        <label>授权域名白名单（逗号分隔）</label>
+        <label>授权域名白名单（逗号 / 中文逗号 / 换行分隔，支持多主域名）</label>
         <div class="row2">
-          <input type="text" id="domains" placeholder="example.com,a.example.com">
+          <input type="text" id="domains" placeholder="example.com,another.org">
           <button id="extract-domains" class="ghost" type="button">从种子提取</button>
         </div>
-        <div class="hint">默认包含子域；未填则拒绝运行（安全约束）</div>
+        <div class="hint">每个主域名（含子域）独立分组配额互不挤占；自动清洗协议/端口/大小写；未填则拒绝运行（安全约束）</div>
       </div>
 
       <div class="form-row row2">

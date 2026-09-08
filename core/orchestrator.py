@@ -24,6 +24,7 @@ from core.normalizer import (
     is_in_scope,
     is_static_asset,
     normalize_url,
+    primary_domain_index,
     resolve_url,
     url_hash,
 )
@@ -76,6 +77,9 @@ class Orchestrator:
         self.summary = Summary()
         self.queue: asyncio.Queue[tuple[str, int, str]] = asyncio.Queue()
         self.per_domain: Counter[str] = Counter()
+        # 主域名分组预算：多主域名并存时，每个主域名（含其子域）独立配额，
+        # A 主域名的资产不会挤占 B 主域名的预算。
+        self.per_group: Counter[int] = Counter()
         self._cancel = False
         self._paused = False
         self._pause_event = asyncio.Event()
@@ -263,14 +267,21 @@ class Orchestrator:
     # ---------- 单节点处理 ----------
     async def _process(self, url: str, depth: int, source: str) -> None:
         domain = host_of(url)
+        group = primary_domain_index(domain, self.cfg.scope.domains, self.cfg.scope.allow_subdomains)
         if self.summary.total_nodes >= self.cfg.scan.max_total_nodes:
             self.summary.skipped_budget += 1
             return
         if self.per_domain[domain] >= self.cfg.scan.max_nodes_per_domain:
             self.summary.skipped_budget += 1
             return
+        # 主域名分组预算隔离：多主域名并存时各自独立配额，互不挤占
+        if group is not None and self.per_group[group] >= self.cfg.scan.max_nodes_per_domain:
+            self.summary.skipped_budget += 1
+            return
         self.summary.total_nodes += 1
         self.per_domain[domain] += 1
+        if group is not None:
+            self.per_group[group] += 1
 
         fr = await self.fetcher.fetch(url)
         kind = self.fetcher.classify(fr)

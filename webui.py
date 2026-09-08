@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import sys
 import threading
 import time
 import traceback
@@ -26,6 +27,7 @@ from core.auditor import Auditor
 from core.config import Config
 from core.dedup import Dedup
 from core.fetcher import Fetcher
+from core.normalizer import parse_domains
 from core.orchestrator import Orchestrator
 from core.proxy_pool import ProxyPool
 from storage.db import Store
@@ -206,6 +208,7 @@ class ScanManager:
         cfg.scan.concurrency = int(params.get("concurrency", cfg.scan.concurrency))
         cfg.scan.per_domain_qps = float(params.get("qps", cfg.scan.per_domain_qps))
         cfg.scan.llm_enabled = bool(params.get("llm", True)) and bool(cfg.resolve_api_key())
+        cfg.scan.audit_json = bool(params.get("audit_json", False))
         cfg.proxy.enabled = bool(params.get("proxy", False))
         cfg.scan.render_mode = str(params.get("render_mode", cfg.scan.render_mode))
         cfg.scope.domains = list(params.get("domains", []))
@@ -236,12 +239,18 @@ class ScanManager:
                           f"LLM {'开' if cfg.scan.llm_enabled else '关'}，"
                           f"代理 {'开' if cfg.proxy.enabled else '关'}")
         try:
-            summary = await orch.run(params.get("seeds", []))
+            # 边跑边物化结果：运行中即把 SQLite 里的最新发现/接口/节点同步到
+            # state，供前端「发现/接口/节点」选项卡实时展示（不再等任务完成）。
+            scan_task = asyncio.create_task(orch.run(params.get("seeds", [])))
+            while True:
+                done, _ = await asyncio.wait({scan_task}, timeout=2.0)
+                if done:
+                    break
+                await self._materialize(state, store)
+            summary = await scan_task
             state.summary = dataclasses.asdict(summary)
-            # 物化结果到普通 list（供 HTTP 线程读取，无需再进 asyncio）
-            state.findings = await store.all_findings()
-            state.endpoints = await store.all_endpoints()
-            state.urls = await store.all_urls()
+            # 最终全量刷新一次，保证 done 后数据完整
+            await self._materialize(state, store)
             out = await write_reports(cfg, store, summary)
             state.report_dir = str(out)
             state.status = "cancelled" if orch._cancel else "done"
@@ -254,6 +263,19 @@ class ScanManager:
             await orch.renderer.close()
             store.close()
             logging.getLogger().removeHandler(handler)
+
+    async def _materialize(self, state: ScanState, store: Store) -> None:
+        """把数据库里的最新结果增量同步到 state（HTTP 线程可读）。"""
+        try:
+            st = await store.stats()
+            if st["findings"] != len(state.findings):
+                state.findings = await store.all_findings()
+            if st["endpoints"] != len(state.endpoints):
+                state.endpoints = await store.all_endpoints()
+            if st["urls"] != len(state.urls):
+                state.urls = await store.all_urls()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 MGR: ScanManager | None = None
@@ -352,8 +374,7 @@ class Handler(BaseHTTPRequestHandler):
         seeds = [s.strip() for s in seeds_raw.splitlines()
                  if s.strip() and not s.strip().startswith("#")]
         seeds = [s for s in seeds if s.startswith(("http://", "https://"))]
-        domains_raw = str(params.get("domains", ""))
-        domains = [d.strip() for d in domains_raw.split(",") if d.strip()]
+        domains = parse_domains(str(params.get("domains", "")))
         if not seeds:
             return self._json({"error": "授权扫描清单为空或无合法 http(s) URL"}, 400)
         if not domains:
@@ -402,7 +423,18 @@ def main() -> None:
     base_cfg = Config.load(args.config)
     MGR = ScanManager(base_cfg)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        if e.errno == 10013 or "10013" in str(e):
+            print(f"[!] 错误：端口 {args.port} 已被其他进程占用")
+            print(f"    解决方案：")
+            print(f"    1. 换端口运行：python webui.py -p {args.port + 1}")
+            print(f"    2. 或以管理员身份执行：netstat -ano | findstr :{args.port}")
+            print(f"       然后：taskkill /PID <占用PID> /F")
+        else:
+            print(f"[!] 绑定失败：{e}")
+        sys.exit(1)
     url = f"http://{args.host}:{args.port}"
     print(f"[*] 前端审计 Web UI 已启动：{url}")
     print(f"[*] DeepSeek: {'已配置' if base_cfg.resolve_api_key() else '未配置（UI 将走纯本地正则模式）'}")
