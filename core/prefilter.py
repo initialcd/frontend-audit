@@ -82,7 +82,88 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern]] = [
             r"""(?i)(?:password|passwd|pwd|secret|token|access[_-]?key|api[_-]?key|app[_-]?secret|private[_-]?key|client[_-]?secret|db[_-]?(?:password|pass))["'`]?\s*[:=]\s*["'`]([^"'`\n]{4,128})["'`]"""
         ),
     ),
+    # 扩展：哈希类字段（permissionsHash / authorizationHash / csrfToken 等）
+    (
+        "hash_token",
+        "medium",
+        re.compile(
+            r"""(?i)(?:permissions?[_-]?hash|authorization[_-]?hash|csrf[_-]?token|session[_-]?token|auth[_-]?token|signing[_-]?key|encryption[_-]?key|private[_-]?secret)["'`]?\s*[:=]\s*["'`]([0-9a-f]{32,128})["'`]"""
+        ),
+    ),
+    # 硬编码经纬度/坐标（银行网点、ATM 位置泄露）
+    (
+        "hardcoded_coords",
+        "low",
+        re.compile(
+            r"""(?i)(?:lat|lng|longitude|latitude|coord)["'`]?\s*[:=]\s*["'`]?(-?\d{1,3}\.\d{4,10})"""
+        ),
+    ),
 ]
+
+# ---------- CMS 敏感路径规则 ----------
+# 当工具抓取到这些 URL 时，自动标记为安全发现（零 token 成本）。
+# 格式：(路径模式正则, 发现类型, 严重级别, 说明)
+CMS_SENSITIVE_PATHS: list[tuple[str, str, str, str]] = [
+    # --- 依赖/配置文件泄露 ---
+    (r"/composer\.json$", "dependency_file", "high", "composer.json 依赖声明泄露，可还原完整技术栈"),
+    (r"/composer\.lock$", "dependency_file", "critical", "composer.lock 泄露精确版本号，可匹配所有已知 CVE"),
+    (r"/vendor/composer/installed\.json$", "dependency_file", "critical", "installed.json 泄露所有依赖精确版本，攻击面完全暴露"),
+    (r"/\.env$", "env_file", "critical", ".env 环境变量文件泄露，可能含数据库密码、API 密钥"),
+    (r"/\.env\.\w+$", "env_file", "critical", ".env 变体文件泄露（.env.local / .env.production 等）"),
+    (r"/\.git/HEAD$", "git_leak", "critical", ".git 目录泄露，可还原完整源码历史"),
+    (r"/\.git/config$", "git_leak", "critical", ".git/config 泄露，含远程仓库地址和凭证"),
+    (r"/\.svn/entries$", "vcs_leak", "high", ".svn 目录泄露，SVN 版本控制信息暴露"),
+    # --- CMS 配置文件 ---
+    (r"/sites/default/settings\.php$", "cms_config", "critical", "Drupal settings.php 泄露数据库密码、加密密钥"),
+    (r"/sites/default/services\.yml$", "cms_config", "high", "Drupal services.yml 服务配置泄露"),
+    (r"/sites/default/default\.settings\.php$", "cms_config", "medium", "Drupal 默认配置模板，可能含数据库连接示例"),
+    (r"/wp-config\.php\.bak$", "cms_config", "critical", "WordPress 配置备份泄露"),
+    (r"/configuration\.php$", "cms_config", "critical", "Joomla 配置文件泄露"),
+    # --- 源码/敏感文件 ---
+    (r"/core/includes/.*\.inc$", "source_disclosure", "high", "Drupal 核心 .inc 文件泄露，nginx 未配置 PHP 解析导致源码暴露"),
+    (r"/core/modules/.*\.(?:install|module|inc)$", "source_disclosure", "medium", "Drupal 模块源码泄露"),
+    (r"/themes/[^/]+/[^/]*\.(?:theme|info\.yml|libraries\.yml)$", "theme_source", "high", "Drupal 主题源码/配置泄露"),
+    (r"/themes/custom/.*\.php$", "theme_source", "critical", "自定义主题 PHP 源码泄露"),
+    (r"/modules/custom/.*\.php$", "module_source", "critical", "自定义模块 PHP 源码泄露"),
+    (r"/vendor/bin/", "binary_exposure", "high", "vendor/bin 目录暴露，可能含可执行工具（drush 等）"),
+    (r"/vendor/autoload\.php$", "vendor_exposure", "medium", "Composer 自动加载文件泄露"),
+    # --- 管理后台/敏感路径 ---
+    (r"/phpinfo\.php$", "admin_exposure", "high", "phpinfo.php 暴露完整服务器配置"),
+    (r"/phpMyAdmin/", "admin_exposure", "critical", "phpMyAdmin 暴露数据库管理界面"),
+    (r"/adminer\.php$", "admin_exposure", "critical", "Adminer 数据库管理工具暴露"),
+    (r"/wp-admin/", "admin_exposure", "medium", "WordPress 后台入口暴露"),
+    (r"/webmail/", "admin_exposure", "medium", "Webmail 入口暴露"),
+    (r"/admin/config", "admin_exposure", "medium", "管理后台配置路径暴露"),
+    (r"/debug/", "admin_exposure", "medium", "调试路径暴露"),
+    (r"/test\.php$", "admin_exposure", "medium", "测试文件暴露"),
+    (r"/backup\.(?:sql|tar\.gz|zip|rar)$", "backup_file", "critical", "数据库备份文件泄露"),
+    (r"/db\.sql$", "backup_file", "critical", "数据库 SQL 备份泄露"),
+    (r"/dump\.sql$", "backup_file", "critical", "数据库导出文件泄露"),
+]
+
+# ---------- 源码暴露检测 ----------
+# 当 HTTP 响应内容包含 PHP/Python 源码特征，但 Content-Type 不是 application/x-php 等时，
+# 判定为源码泄露。用在 orchestrator 层，配合 fetcher 的 content_type 做交叉判断。
+SOURCE_CODE_SIGNATURES: list[tuple[str, re.Pattern]] = [
+    ("php_open_tag", re.compile(r"<\?php\s")),
+    ("php_echo", re.compile(r"<\?=\s*\$")),
+    ("php_class_def", re.compile(r"(?:abstract\s+)?class\s+[A-Z]\w+\s+(?:extends|implements|\{)")),
+    ("php_function_def", re.compile(r"(?:public|private|protected|static)\s+function\s+\w+\s*\(")),
+    ("php_namespace", re.compile(r"namespace\s+[A-Z]\\")),
+    ("php_use_statement", re.compile(r"^use\s+[A-Z]\\", re.M)),
+    ("python_import", re.compile(r"^(?:from|import)\s+(?:os|sys|django|flask|requests)\b", re.M)),
+    ("ruby_class", re.compile(r"class\s+\w+\s*<\s*(?:ActiveRecord|ApplicationController)")),
+]
+
+# PHP 文件后缀（nginx 交给 PHP-FPM 处理的）
+_PHP_EXTENSIONS = frozenset({".php", ".phtml", ".php3", ".php4", ".php5", ".phps"})
+
+# 不应该返回源码的 Content-Types
+_SAFE_CONTENT_TYPES_FOR_PHP = frozenset({
+    "text/html", "application/xhtml+xml", "application/json",
+    "text/css", "image/svg+xml",
+})
+
 
 # ---------- 版本信息 ----------
 # 每条规则的第一捕获组必须是版本号本身（_iter_hits 统一取 group(1)）。
@@ -320,3 +401,131 @@ def prefilter_text(
     else:
         res.findings, res.snippets = _scan_patterns(text, context, cap)
     return res
+
+
+# ============================================================
+# 新增：CMS 敏感路径分析 + 源码暴露检测
+# ============================================================
+
+def analyze_url_for_cms_findings(url: str) -> list[LocalFinding]:
+    """分析 URL 路径是否命中 CMS 敏感路径规则库。
+
+    纯路径匹配，零网络开销，在 orchestrator._process 阶段调用。
+    """
+    from urllib.parse import urlparse as _urlparse
+    findings: list[LocalFinding] = []
+    try:
+        path = _urlparse(url).path
+    except Exception:  # noqa: BLE001
+        return findings
+    for pattern, ftype, severity, reason in CMS_SENSITIVE_PATHS:
+        if re.search(pattern, path, re.I):
+            findings.append(LocalFinding(
+                ftype=ftype,
+                severity=severity,
+                value=path,
+                context=f"URL 路径匹配: {path}",
+                confidence=0.9,
+                reason=reason,
+            ))
+    return findings
+
+
+def detect_source_code_exposure(
+    body: bytes, url: str, content_type: str
+) -> list[LocalFinding]:
+    """检测源码暴露：当响应内容包含 PHP/Python 源码特征但 Content-Type 不应含源码时。
+
+    专门针对 nginx 配置错误导致 .inc/.module 等文件返回源码的场景。
+    在 orchestrator._process 阶段，拿到 fetcher 响应后调用。
+    """
+    findings: list[LocalFinding] = []
+    if not body:
+        return findings
+
+    # 如果 Content-Type 已经是 PHP 相关，那是正常执行，不算泄露
+    ct_lower = content_type.lower()
+    if "php" in ct_lower or "x-httpd" in ct_lower:
+        return findings
+
+    # 仅对非 PHP content-type 检测源码特征
+    # 如果是 text/html 但内容实际是 PHP 源码 → 这是泄露
+    try:
+        text = body.decode("utf-8", errors="ignore")[:50000]  # 只看前 50KB
+    except Exception:  # noqa: BLE001
+        return findings
+
+    matched_signatures: list[str] = []
+    for name, pattern in SOURCE_CODE_SIGNATURES:
+        if pattern.search(text):
+            matched_signatures.append(name)
+
+    # 至少命中 2 个 PHP 特征才判定为源码泄露（避免误报）
+    php_hits = [s for s in matched_signatures if s.startswith("php_")]
+    if len(php_hits) >= 2:
+        from urllib.parse import urlparse as _urlparse
+        path = ""
+        try:
+            path = _urlparse(url).path
+        except Exception:  # noqa: BLE001
+            pass
+        findings.append(LocalFinding(
+            ftype="source_code_disclosure",
+            severity="high",
+            value=path,
+            context=f"Content-Type: {content_type} | PHP 特征: {', '.join(php_hits[:5])}",
+            confidence=0.95,
+            reason=(
+                f"响应包含 PHP 源码特征 ({', '.join(php_hits[:3])})，"
+                f"但 Content-Type 为 {content_type}，疑似 nginx 配置错误导致源码泄露"
+            ),
+        ))
+    elif matched_signatures:
+        # 只有 1 个特征，低置信度
+        from urllib.parse import urlparse as _urlparse
+        path = ""
+        try:
+            path = _urlparse(url).path
+        except Exception:  # noqa: BLE001
+            pass
+        findings.append(LocalFinding(
+            ftype="source_code_disclosure",
+            severity="medium",
+            value=path,
+            context=f"Content-Type: {content_type} | 特征: {', '.join(matched_signatures)}",
+            confidence=0.6,
+            reason=f"响应包含代码特征 ({', '.join(matched_signatures)})，可能为源码泄露",
+        ))
+
+    return findings
+
+
+def detect_json_config_secrets(text: str) -> list[LocalFinding]:
+    """扫描 JSON 配置块（如 drupal-settings-json）中的敏感字段。
+
+    专门针对 <script type="application/json"> 中的配置泄露。
+    比 generic_secret 更宽泛：捕获哈希、签名密钥、session 相关字段。
+    """
+    findings: list[LocalFinding] = []
+    # 匹配 JSON key:value 中 value 为长十六进制串的情况
+    # 例：{"permissionsHash":"0ee66c0b...d5b5"}
+    for m in re.finditer(
+        r"""["']([\w.-]{3,50})["']\s*:\s*["']([0-9a-f]{32,128})["']""",
+        text,
+    ):
+        key, value = m.group(1), m.group(2)
+        # 只关注安全相关字段
+        security_keywords = (
+            "hash", "token", "secret", "key", "sign",
+            "auth", "csrf", "session", "nonce", "signature",
+        )
+        if any(kw in key.lower() for kw in security_keywords):
+            findings.append(LocalFinding(
+                ftype="config_hash_leak",
+                severity="high",
+                value=f"{key}={value[:32]}...",
+                context=m.group(0)[:200],
+                confidence=0.8,
+                reason=f"JSON 配置块中安全相关字段 '{key}' 泄露哈希值，可能用于会话伪造或权限绕过",
+            ))
+    return findings

@@ -6,7 +6,10 @@
 
 - 递归爬取：从种子 URL 出发，提取 HTML 中的 `<script>`、JS 中的 chunk/sourcemap，持续扩展下载范围，不做目录爆破。
 - 本地正则扫描：密钥、Token、版本号、API 路径，零 token 成本。
-- LLM 二次审计：把正则命中的可疑片段交给 DeepSeek 确认，默认只对 JS 开启，JSON 可按需开启。
+- **CMS 敏感路径检测**：基于路径规则库（composer.json / installed.json / settings.php / .env / .git/HEAD / vendor/bin、主题与模块源码、备份文件、phpMyAdmin 等）自动标记依赖与配置泄露，零 token 成本。
+- **源码暴露检测**：响应体含 PHP/Python 源码特征但 Content-Type 非源码类型时判定源码泄露（针对 nginx 未配置解析、`.inc`/`.module` 等返回源码的场景）。
+- **JSON 配置块分析**：`drupal-settings-json` 等内联 JSON 中的 `permissionsHash` / `csrfToken` 等安全字段哈希泄露检测。
+- LLM 二次审计：把正则命中的可疑片段交给 DeepSeek 确认，默认只对 JS 开启，JSON 可按需开启；提示词内置源码暴露与 CMS 配置泄露识别。
 - 接口探测：对发现的 API 路径发 OPTIONS / POST，判断可用方法与 CORS。
 - 增强渲染：Playwright + CDP + JS Hook，捕获 SPA 动态加载的代码。
 - 域名白名单约束：未配置白名单拒绝运行，递归不越界。
@@ -176,6 +179,42 @@ httpx 那样一次性把一批存活 URL 列出来。若你需要"先列存活�
 - **降低被识别概率的手段**：每域 QPS 调低（1–3/s）、保留 `qps_jitter` 抖动、走代理池
   （`proxy.enabled`）、使用真实浏览器 UA（默认已带）、避免对同一站点长时间高频递归。
 - 目标站点防护强度未知时，先小并发试跑一轮看是否有验证码/429，再决定是否加码。
+
+## 新增检测能力（CMS 靶标实战沉淀）
+
+针对 Drupal / WordPress / Joomla 等 CMS 靶标实战新增三类零 token 检测，均在 `core/prefilter.py`：
+
+### 1. CMS 敏感路径规则库（`CMS_SENSITIVE_PATHS`）
+
+对抓取到的 URL 路径做纯正则匹配，命中即入库，不消耗 token。已覆盖：
+
+| 类别 | 示例路径 | 严重级别 |
+|------|---------|---------|
+| 依赖声明 | `/composer.json`、`/composer.lock` | high / critical |
+| 精确版本 | `/vendor/composer/installed.json` | critical |
+| 环境变量 | `/.env`、`/.env.production` | critical |
+| 版本控制 | `/.git/HEAD`、`/.git/config`、`/.svn/entries` | critical / high |
+| CMS 配置 | `/sites/default/settings.php`、`/services.yml` | critical / high |
+| 源码泄露 | `/core/includes/*.inc`、`/themes/*/*.theme|*.info.yml` | high |
+| 可执行文件 | `/vendor/bin/...`（drush 等） | high |
+| 管理入口 | `/phpMyAdmin/`、`/adminer.php`、`/phpinfo.php` | critical / high |
+| 备份文件 | `/backup.sql`、`/db.sql`、`/dump.sql` | critical |
+
+> 新增规则直接往 `CMS_SENSITIVE_PATHS` 列表追加 `(正则, 类型, 严重级别, 说明)` 即可。
+
+### 2. 源码暴露检测（`detect_source_code_exposure`）
+
+当响应体包含 PHP/Python/Ruby 源码特征（`<?php`、`class X extends`、`function`、`namespace`、`import` 等），
+但 Content-Type 不是源码类型（如 `text/plain`、`text/html`）时，判定为源码泄露——典型场景是
+nginx 只对 `.php` 走 PHP-FPM，`.inc`/`.module`/`.theme` 被当静态文件原样返回。
+
+误报控制：命中 ≥2 个 PHP 特征才判定 high，单项命中仅 medium。
+
+### 3. JSON 配置块哈希泄露（`detect_json_config_secrets`）
+
+扫描内联 `<script type="application/json">`（如 Drupal 的 `drupal-settings-json`）中的安全字段：
+`permissionsHash`、`csrfToken`、`sessionToken`、`nonce` 等命名的 32–128 位十六进制值，
+可能用于会话伪造或权限绕过。同时 `generic_secret` 正则扩展了 `hash_token` 规则。
 
 ## 输出报告
 

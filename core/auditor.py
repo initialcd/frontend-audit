@@ -22,6 +22,9 @@ class Finding(BaseModel):
     context: str = ""
     confidence: float = 0.5
     reason: str = ""
+    # 新增：CMS/源码相关扩展字段（LLM 审计结果可能返回这些）
+    source_file: str = ""  # 源文件 URL
+    cms_type: str = ""     # CMS 类型（drupal/wordpress/joomla 等）
 
 
 class Endpoint(BaseModel):

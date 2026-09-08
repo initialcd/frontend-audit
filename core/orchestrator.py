@@ -31,7 +31,10 @@ from core.normalizer import (
 from core.prefilter import (
     PrefilterResult,
     decode,
+    detect_json_config_secrets,
+    detect_source_code_exposure,
     extract_scripts,
+    analyze_url_for_cms_findings,
     prefilter_js,
     prefilter_text,
 )
@@ -295,6 +298,19 @@ class Orchestrator:
             return
         self.summary.fetched += 1
 
+        # ===== 新增：CMS 敏感路径分析（零 token 成本）=====
+        cms_findings = analyze_url_for_cms_findings(url)
+        for f in cms_findings:
+            await self._record_finding(fr.url, f.ftype, f.severity, f.value,
+                                       f.context, f.confidence, f.reason)
+
+        # ===== 新增：源码暴露检测（零 token 成本）=====
+        if fr.body and kind in ("html", "text", "other"):
+            sc_findings = detect_source_code_exposure(fr.body, url, fr.content_type)
+            for f in sc_findings:
+                await self._record_finding(fr.url, f.ftype, f.severity, f.value,
+                                           f.context, f.confidence, f.reason)
+
         if kind == "html":
             self.summary.html += 1
             await self._handle_html(fr, depth)
@@ -318,6 +334,9 @@ class Orchestrator:
         for code in inline:
             pf = prefilter_text(code, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap,
                                 self.cfg.scan.chunk_scan_kb)
+            # ===== 新增：JSON 配置块敏感字段检测 =====
+            json_cfg_findings = detect_json_config_secrets(code)
+            pf.findings.extend(json_cfg_findings)
             await self._record_local(fr.url, pf, depth)
 
         # 增强渲染（三种模式）
@@ -366,6 +385,12 @@ class Orchestrator:
         text = decode(fr.body)
         pf = prefilter_js(text, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap,
                           self.cfg.scan.chunk_scan_kb)
+        # ===== 新增：源码暴露检测（.inc 等被当 JS 返回）=====
+        if fr.body:
+            sc_findings = detect_source_code_exposure(fr.body, fr.url, fr.content_type)
+            for f in sc_findings:
+                await self._record_finding(fr.url, f.ftype, f.severity, f.value,
+                                           f.context, f.confidence, f.reason)
 
         # sourcemap：记录泄露 + 尝试抓取（.map 内容本身有价值）
         if pf.source_map:
@@ -391,6 +416,9 @@ class Orchestrator:
         text = decode(fr.body)
         pf = prefilter_text(text, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap,
                             self.cfg.scan.chunk_scan_kb)
+        # ===== 新增：JSON 配置块敏感字段检测 =====
+        json_cfg_findings = detect_json_config_secrets(text)
+        pf.findings.extend(json_cfg_findings)
         await self._record_local(fr.url, pf, depth)
         if self.cfg.scan.audit_json:
             await self._llm_audit(fr, pf, depth)
