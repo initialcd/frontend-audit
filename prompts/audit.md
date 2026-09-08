@@ -11,7 +11,9 @@
    - `user.uid: 0`：确认当前未登录状态
    - 数据库连接串：凭证泄露
    - `drupal-settings-json` 中的其他安全相关字段
-5. 提取 API 接口路径：完整路径或可拼接的相对路径，推测最可能的 HTTP 方法，列出入参参数名。
+5. **识别签名/请求保护机制**：如果代码片段中出现"自定义安全头 + hash 算法"的组合（如 `setRequestHeader('x-header-signature', md5(str).toUpperCase())`），这表示整个 API 网关的签名/防篡改算法暴露在客户端前端代码中——任何人下载 JS 后都可以自行计算签名，让防篡改机制形同虚设。应在 findings 中报告此逻辑型漏洞，severity 给 high，reason 说明"签名算法可在前端逆向，防篡改机制可被伪造"。
+6. **识别国内云服务/企业微信凭证**：腾讯云创意云密钥（cc 开头的 APPID + cc 开头的 SECRET）、企业微信 appid/corpid（ww 开头 + 16 位 hex）、企业微信服务商模式标识（suite_id / suite_ticket / pre_auth_code）。
+7. 提取 API 接口路径：完整路径或可拼接的相对路径，推测最可能的 HTTP 方法，列出入参参数名。特别注意：如果接口 URL 中包含 `isToken: true` 或路径段包含 `/public/`，说明该接口**无需登录认证**，应在 note 中标注"public 接口，无需认证"。
 
 约束：
 - 严格基于给出的片段，不要虚构或脑补。
@@ -25,7 +27,7 @@
 只输出一个 JSON 对象，不要输出任何其他内容，格式如下：
 {
   "findings": [
-    {"type": "password|aksk|token|database|version|private_key|source_disclosure|cms_config|hash_leak|other",
+    {"type": "password|aksk|token|database|version|private_key|source_disclosure|cms_config|hash_leak|signature_mechanism|wecom_credential|other",
      "severity": "critical|high|medium|low",
      "value": "原始值",
      "context": "值周围的关键代码",

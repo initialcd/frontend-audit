@@ -216,6 +216,44 @@ nginx 只对 `.php` 走 PHP-FPM，`.inc`/`.module`/`.theme` 被当静态文件�
 `permissionsHash`、`csrfToken`、`sessionToken`、`nonce` 等命名的 32–128 位十六进制值，
 可能用于会话伪造或权限绕过。同时 `generic_secret` 正则扩展了 `hash_token` 规则。
 
+## 新增检测能力（SCRM/企微 实战沉淀，2026-09）
+
+针对企业微信 SCRM / 银行网银前端实战新增以下规则，均在 `core/prefilter.py`：
+
+### 4. 国内云服务 & 企业微信凭证（`SECRET_PATTERNS` 扩展）
+
+| 规则 | 正则特征 | 严重级别 | 实战样本 |
+|------|---------|---------|---------|
+| `creative_cloud_appid` | `cc` + 14位数字 | high | `cc20210224145031` |
+| `creative_cloud_secret` | `cc` + 小写字母数字25-40位 | critical | `ccjktx6spz7ys26643q9z15urjh183c1` |
+| `tencent_other_secret` | `AK` + 20位以上 | critical | CSII 网银前端 |
+| `wecom_corpid` | `ww` + 16位十六进制 | high | `wwf336afe442d36264` |
+| `wecom_agentid` | `agentId = 4-10位数字` | high | `1000029` |
+| `wecom_suite` | `suite_id/suite_ticket/pre_auth_code` | high | 企业微信服务商模式 |
+| `wechat_appid` | `wx` + 16位十六进制 | medium | 公众号/小程序 |
+| `internal_ip` | RFC1918 内网 IP | medium | CSII 网银 10.x.x.x |
+| `custom_sign_header` | `x-*-signature` 自定义头 | high | `x-header-signature` |
+
+> 注意：`ww`/`wx` 开头的 appid 若未命中，可能是运行时从 `/public/getScanAuthorizeLogin`
+> 等接口动态获取的（不在静态 JS 中）——这是静态审计的边界，需结合动态测试。
+
+### 5. 签名机制检测（`detect_signature_mechanism`）
+
+**逻辑型发现**（非值型密钥）：当 JS 中同时出现
+「自定义签名头（`x-*-signature`）+ hash 算法调用（`md5()`/`sha*()`）+ `setRequestHeader()` 注入」
+时，判定签名/防篡改算法暴露在客户端，可被逆向伪造。参考样本 `paramsHandler.js`：
+```javascript
+var signature = md5(str);
+_this.setRequestHeader('x-header-signature', signature.toUpperCase());
+```
+报告类型：`signature_mechanism`，severity `high`。
+
+### 6. LLM 提示词扩展（`prompts/audit.md`）
+
+- 识别签名机制组合 → 报告 `signature_mechanism`
+- 识别企业微信/腾讯创意云凭证 → 报告 `wecom_credential`
+- 接口含 `isToken: true` 或路径含 `/public/` → 在 note 标注"public 接口，无需认证"
+
 ## 输出报告
 
 每次扫描在 `reports/<时间戳>/` 下生成：

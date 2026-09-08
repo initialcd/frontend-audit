@@ -98,6 +98,39 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern]] = [
             r"""(?i)(?:lat|lng|longitude|latitude|coord)["'`]?\s*[:=]\s*["'`]?(-?\d{1,3}\.\d{4,10})"""
         ),
     ),
+    # --- 国内云服务凭证（实测样本：weshine SCRM 前端泄露腾讯创意云密钥）---
+    # 腾讯云创意云 APPID：cc + 14位数字（如 cc20210224145031）
+    ("creative_cloud_appid", "high", re.compile(r"\bcc\d{14}\b")),
+    # 腾讯云创意云 SECRET：cc + 小写字母数字 25-40 位（如 ccjktx6spz7ys26643q9z15urjh183c1）
+    (
+        "creative_cloud_secret",
+        "critical",
+        re.compile(r"""["'](cc[a-z0-9]{25,40})["']"""),
+    ),
+    # 腾讯云 COS/API SecretId 变体：AKID 之外的其他腾讯云格式
+    ("tencent_other_secret", "critical", re.compile(r"\bAK[0-9A-Za-z]{20,}\b")),
+    # --- 企业微信/微信生态凭证 ---
+    # 企业微信 corpid/appid：ww + 16位十六进制（如 wwf336afe442d36264）
+    ("wecom_corpid", "high", re.compile(r"\bww[a-f0-9]{16}\b")),
+    # 企业微信 agentId 声明：agentId = 4-10位数字
+    ("wecom_agentid", "high", re.compile(r"""(?i)agentid["']?\s*[:=]\s*["']?(\d{4,10})""")),
+    # 企业微信服务商凭证：suite_id / suite_ticket / pre_auth_code
+    ("wecom_suite", "high", re.compile(r"""(?i)(?:suite_id|suite_ticket|pre_auth_code)\s*[:=]""")),
+    # 微信开放平台 appid：wx + 16位十六进制（公众号/小程序）
+    ("wechat_appid", "medium", re.compile(r"\bwx[a-f0-9]{16}\b")),
+    # --- 内网/保留 IP 硬编码 ---
+    (
+        "internal_ip",
+        "medium",
+        re.compile(
+            r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+            r"192\.168\.\d{1,3}\.\d{1,3}|"
+            r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"
+        ),
+    ),
+    # --- 自定义安全头/签名机制（可伪造签名风险）---
+    # x-header-signature 等自定义签名头：签名算法通常在前端，可逆向伪造
+    ("custom_sign_header", "high", re.compile(r"""(?i)x-[a-z0-9_-]*signature""")),
 ]
 
 # ---------- CMS 敏感路径规则 ----------
@@ -382,6 +415,8 @@ def prefilter_js(
         res.findings, res.snippets = _scan_chunked(text, context, cap, chunk_kb * 1024)
     else:
         res.findings, res.snippets = _scan_patterns(text, context, cap)
+    # 逻辑型发现：签名/请求保护机制（独立于正则值型发现的组合检测）
+    res.findings.extend(detect_signature_mechanism(text, context))
     return res
 
 
@@ -528,4 +563,64 @@ def detect_json_config_secrets(text: str) -> list[LocalFinding]:
                 confidence=0.8,
                 reason=f"JSON 配置块中安全相关字段 '{key}' 泄露哈希值，可能用于会话伪造或权限绕过",
             ))
+    return findings
+
+
+# ---------- 签名机制 / 请求保护逻辑检测 ----------
+# 前端出现"自定义签名头 + 拦截器注入 + hash 算法"组合时，说明整个 API 网关的
+# 签名/防篡改算法暴露在客户端 JS 中，可被逆向并随意伪造——这是高价值逻辑型发现
+# （区别于上面的值型密钥泄露）。参考样本：weshine SCRM 的 paramsHandler.js。
+SIGN_HEADER_RE = re.compile(r"""["']x-[a-z0-9_-]*signature["']""", re.I)
+MD5_CALL_RE = re.compile(r"\bmd5\s*\(", re.I)
+SHA_CALL_RE = re.compile(r"\b(?:sha1|sha256|sha512)\s*\(", re.I)
+SET_HEADER_RE = re.compile(r"""setRequestHeader\s*\(""", re.I)
+APPEND_HEADER_RE = re.compile(r"""headers\s*\[\s*["']x-[a-z0-9_-]*signature["']\s*\]""", re.I)
+
+
+def detect_signature_mechanism(text: str, context: int = 120) -> list[LocalFinding]:
+    """检测前端签名/请求保护机制（逻辑型泄露，非值型）。
+
+    命中组合：
+    - 自定义 x-*-signature 头（SIGN_HEADER_RE / APPEND_HEADER_RE）
+    - 同时伴随 hash 算法调用（md5/sha）。
+    返回的 finding 指向"签名算法可在前端逆向"这一事实。
+    """
+    findings: list[LocalFinding] = []
+    hits: list[tuple[int, int]] = []
+
+    for pat in (SIGN_HEADER_RE, APPEND_HEADER_RE):
+        for m in pat.finditer(text):
+            hits.append((m.start(), m.end()))
+
+    if not hits:
+        return findings
+
+    has_hash = bool(MD5_CALL_RE.search(text) or SHA_CALL_RE.search(text))
+    has_set_header = bool(SET_HEADER_RE.search(text))
+
+    # 合并重叠命中，取唯一上下文
+    merged: list[list[int]] = []
+    for a, b in sorted(hits):
+        if merged and a <= merged[-1][1] + 40:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+
+    for a, b in merged:
+        ctx_text = text[max(0, a - context): min(len(text), b + context)].strip().replace("\n", " ")
+        sig_name = text[a:b][:80]
+        reason_parts = ["前端代码中存在自定义签名头"]
+        if has_hash:
+            reason_parts.append("且调用 hash 算法(md5/sha)")
+        if has_set_header:
+            reason_parts.append("且通过 setRequestHeader 注入请求头")
+        reason_parts.append("——签名/防篡改算法暴露在客户端，可被逆向伪造")
+        findings.append(LocalFinding(
+            ftype="signature_mechanism",
+            severity="high",
+            value=sig_name,
+            context=ctx_text[:300],
+            confidence=0.85,
+            reason="".join(reason_parts),
+        ))
     return findings
