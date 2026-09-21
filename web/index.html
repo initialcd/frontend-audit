@@ -106,17 +106,30 @@
         </div>
       </div>
       <div class="form-row">
+        <div class="check">
+          <input type="checkbox" id="verify_tls">
+          <label for="verify_tls" style="margin:0">校验 TLS 证书（取消勾选可抓自签/私有 CA 的内网站点）</label>
+        </div>
+        <div class="hint">内网、政企、银行站点常用自签证书：不关这项会整站抓不到（节点 0、下载 0）</div>
+      </div>
+      <div class="form-row">
         <label>增强渲染模式（需安装 Playwright）</label>
         <select id="render_mode">
           <option value="hybrid">hybrid — 仅对 SPA 空壳启用（推荐，平衡速度与覆盖率）</option>
           <option value="full">full — 对所有页面启用（覆盖率最高，速度较慢）</option>
           <option value="off">off — 关闭渲染，纯 httpx 模式（离线推荐）</option>
         </select>
+        <div class="hint" id="render-hint"></div>
       </div>
 
       <div class="btn-row">
         <button id="start" class="primary" type="button">开始下载</button>
         <button id="cancel" class="ghost" type="button" style="display:none">取消</button>
+        <button id="reset" class="ghost danger" type="button" style="display:none">强制复位</button>
+      </div>
+      <div class="hint" style="margin-top:9px;line-height:1.6">
+        模式选错不用重启工具：运行中直接点「放弃并重开」，会放弃当前任务并按新选择立即开始；
+        「取消」则立即停下但保留已抓到的结果（可在 reports-ui/&lt;任务号&gt;/ 下取报告）。
       </div>
     </div>
   </div>

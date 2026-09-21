@@ -28,8 +28,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from core.config import Config
@@ -226,7 +229,12 @@ class Renderer:
         self._lock = asyncio.Lock()
 
     def available(self) -> bool:
-        """检测 Playwright 是否可用（不阻塞，结果缓存）。"""
+        """Playwright 包是否可用（不阻塞，结果缓存）。
+
+        注意：这只代表"能 import playwright"，不代表浏览器内核已下载。
+        内核缺失时首次渲染会在 _ensure_browser 里失败并降级，用 browser_ready()
+        可以提前判断，用于界面/日志提示。
+        """
         if self._available is None:
             try:
                 import playwright  # noqa: F401
@@ -234,6 +242,29 @@ class Renderer:
             except ImportError:
                 self._available = False
         return self._available
+
+    @staticmethod
+    def browser_dir() -> Path:
+        """Playwright 浏览器内核的安装目录（跟随官方约定与环境变量）。"""
+        env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        if env and env != "0":
+            return Path(env)
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            return Path(base) / "ms-playwright"
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Caches" / "ms-playwright"
+        return Path.home() / ".cache" / "ms-playwright"
+
+    def browser_ready(self) -> bool:
+        """浏览器内核是否已下载（chromium-<build> 目录存在）。仅用于提示，不阻断渲染。"""
+        if not self.available():
+            return False
+        d = self.browser_dir()
+        try:
+            return d.is_dir() and any(p.name.startswith("chromium") for p in d.iterdir())
+        except OSError:
+            return False
 
     async def _ensure_browser(self) -> bool:
         if not self.available():

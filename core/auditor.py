@@ -104,11 +104,24 @@ class Auditor:
                     continue
                 if resp.status_code != 200:
                     last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    if resp.status_code in (400, 404):
+                        last_error += "（检查 deepseek.model 与 base_url 是否与你的服务端一致）"
                     break
                 data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                obj = json.loads(_strip_fences(content))
-                return _coerce(obj)
+                choice = (data.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                content = message.get("content") or ""
+                reasoning = message.get("reasoning_content") or ""
+                raw = _extract_json(content, reasoning)
+                if not raw:
+                    last_error = (
+                        f"未返回可解析的 JSON（finish_reason={choice.get('finish_reason')}，"
+                        f"content {len(content)} 字符，reasoning {len(reasoning)} 字符）"
+                    )
+                    if choice.get("finish_reason") == "length":
+                        last_error += "；输出被截断，可调大 deepseek.max_tokens"
+                    break
+                return _coerce(json.loads(raw))
             except (httpx.HTTPError, json.JSONDecodeError, KeyError, ValueError) as exc:
                 last_error = str(exc)
                 await asyncio.sleep(2)
@@ -122,3 +135,38 @@ def _strip_fences(content: str) -> str:
         content = re.sub(r"^```(?:json)?\s*", "", content)
         content = re.sub(r"\s*```$", "", content)
     return content
+
+
+def _extract_json(content: str, reasoning: str = "") -> str:
+    """取出模型输出中的 JSON 文本。
+
+    部分服务端/模型（尤其是带思维链的）会先输出 reasoning_content，正文 content
+    可能为空或被截断；此时从推理内容里回退提取第一个完整 JSON 对象，避免整条结果作废。
+    """
+    for text in (content, reasoning):
+        if not text or not text.strip():
+            continue
+        candidate = _strip_fences(text.strip())
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            pass
+        start = candidate.find("{")
+        while start != -1:
+            depth = 0
+            for i in range(start, len(candidate)):
+                ch = candidate[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        block = candidate[start:i + 1]
+                        try:
+                            json.loads(block)
+                            return block
+                        except json.JSONDecodeError:
+                            break
+            start = candidate.find("{", start + 1)
+    return ""

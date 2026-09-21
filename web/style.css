@@ -67,7 +67,9 @@ button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 button.primary:disabled { opacity: .5; cursor: not-allowed; }
 button.ghost { background: transparent; }
-.btn-row { display: flex; gap: 10px; margin-top: 4px; }
+button.danger { color: var(--err); border-color: rgba(214, 53, 82, .5); }
+button.danger:hover { border-color: var(--err); background: rgba(214, 53, 82, .07); }
+.btn-row { display: flex; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
 
 .main { display: flex; flex-direction: column; }
 .tabs { display: flex; gap: 2px; background: var(--panel); border-bottom: 1px solid var(--border); }

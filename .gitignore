@@ -8,7 +8,11 @@ state*.db
 reports/
 reports-smoke/
 reports-ui/
+reports-spa/
 downloads/
 downloads-ui/
+downloads-uitest/
+dump/
+dump-*/
 config.yaml
 config.local.yaml

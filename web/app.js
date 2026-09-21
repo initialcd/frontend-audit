@@ -2,9 +2,37 @@ const $ = (id) => document.getElementById(id);
 let pollTimer = null;
 let startedAt = null;
 let currentStatus = "idle";
+let currentScanId = "";        // 当前展示的任务号：一旦变化就清空结果区，避免新旧任务串台
+let cancelSince = 0;           // 进入"取消中"的时间戳，用于判断是否卡住
+let liveMode = "";             // 当前正在跑的任务实际使用的模式
 let lastLiveLoad = 0; // 运行中结果表刷新的节流时间戳（2s 一次，避免大表高频重建）
 let llmAvailable = false;
+let renderReady = false;      // Playwright 是否真的可用（不可用时渲染选项形同虚设）
 let currentMode = "download"; // download | audit
+
+const ACTIVE = ["running", "paused", "cancelling"];
+const isActive = (s) => ACTIVE.includes(s);
+
+// 渲染下拉的实时说明：把"选了但没生效"的情况直接写在界面上
+function updateRenderHint() {
+  const hint = $("render-hint");
+  const mode = $("render_mode").value;
+  if (mode === "off") {
+    hint.textContent = "已关闭渲染：只抓 HTML 里静态写着的资源，SPA 运行时动态加载的 chunk 抓不到";
+    hint.style.color = "";
+    return;
+  }
+  if (!renderReady) {
+    hint.textContent = "[!] Playwright 不可用，该选项当前无效（不会真的渲染）。"
+      + "安装：pip install playwright && python -m playwright install chromium";
+    hint.style.color = "var(--err)";
+    return;
+  }
+  hint.textContent = mode === "full"
+    ? "所有 HTML 页面都会启动浏览器渲染：覆盖最全，最慢"
+    : "仅当页面是 SPA 空壳（正文很短 + 有外链脚本）时才渲染";
+  hint.style.color = "";
+}
 
 // ---------- 初始化 ----------
 async function init() {
@@ -17,7 +45,10 @@ async function init() {
     $("llm").checked = cfg.llm_enabled && cfg.llm_available;
     $("audit_json").checked = !!cfg.audit_json;
     $("proxy").checked = cfg.proxy_enabled;
+    $("verify_tls").checked = cfg.verify_tls !== false;
     $("render_mode").value = cfg.render_mode || "hybrid";
+    renderReady = !!cfg.render_ready;
+    updateRenderHint();
     $("live-concurrency").value = cfg.concurrency;
     $("live-depth").value = cfg.max_depth;
     const llmBadge = $("badge-llm");
@@ -57,7 +88,6 @@ function applyMode(mode) {
   $("offline-note-audit").style.display = (!isDownload && !llmAvailable) ? "" : "none";
   $("card-downloaded").style.display = isDownload ? "" : "none";
 
-  $("start").textContent = isDownload ? "开始下载" : "开始扫描";
   const badge = $("badge-mode");
   badge.textContent = "模式: " + (isDownload ? "仅下载（离线可用）" : "审计");
   badge.className = "badge " + (isDownload ? "on" : "");
@@ -70,6 +100,9 @@ function applyMode(mode) {
   const active = document.querySelector(".tab.active");
   if (active && active.classList.contains("audit-only") && isDownload) switchTab("progress");
   if (active && active.classList.contains("file-only") && !isDownload) switchTab("progress");
+
+  // 运行中改模式不打断当前任务：按钮文案与提示需要跟着刷新
+  updateControls(currentStatus);
 }
 
 document.querySelectorAll('input[name="mode"]').forEach((r) =>
@@ -88,6 +121,7 @@ document.querySelectorAll(".tab").forEach((t) =>
 
 // ---------- LLM 开关联动 JSON 审计 ----------
 $("llm").addEventListener("change", syncAuditJson);
+$("render_mode").addEventListener("change", updateRenderHint);
 
 // ---------- 从种子提取域名 ----------
 $("extract-domains").addEventListener("click", () => {
@@ -103,12 +137,24 @@ $("extract-domains").addEventListener("click", () => {
   else alert("未能从种子中提取到域名，请检查 URL 格式");
 });
 
-// ---------- 开始扫描 ----------
+// ---------- 开始 / 放弃并重开 ----------
 $("start").addEventListener("click", async () => {
   const seeds = $("seeds").value.split(/\r?\n/).map((s) => s.trim()).filter((s) => s && !s.startsWith("#"));
   const domains = $("domains").value.split(",").map((s) => s.trim()).filter(Boolean);
   if (!seeds.length) return alert("请填写授权扫描清单（至少一个 URL）");
   if (!domains.length) return alert("请填写授权域名白名单（安全约束，未填拒绝运行）");
+
+  // 运行中点击 = 放弃当前任务，按现在的模式/参数立刻重开（模式选错的主路径）
+  const busy = isActive(currentStatus);
+  if (busy) {
+    const ok = confirm(
+      "当前任务正在运行（" + statusText(currentStatus) + "）。\n\n" +
+      "继续将【放弃】它，并按现在的选择立即开始新任务：\n" +
+      "  模式：" + (currentMode === "download" ? "仅下载" : "审计") + "\n\n" +
+      "被放弃的任务在后台自行收尾，已抓到的数据与报告保留在 reports-ui/<任务号>/。\n\n确定重开吗？"
+    );
+    if (!ok) return;
+  }
 
   const body = {
     seeds: seeds.join("\n"),
@@ -119,25 +165,29 @@ $("start").addEventListener("click", async () => {
     llm: $("llm").checked,
     audit_json: $("audit_json").checked,
     proxy: $("proxy").checked,
+    verify_tls: $("verify_tls").checked,
     render_mode: $("render_mode").value,
     mode: currentMode,
     out_dir: $("out_dir").value.trim(),
+    force: busy,          // 给后端顺手兜底：即使复位接口没走到也能抢占
   };
-  updateControls("running");
   startedAt = Date.now();
+  cancelSince = 0;
   switchTab("progress");
+  setStatus(busy ? "正在放弃旧任务并启动新任务…" : "正在启动…");
   try {
     const res = await fetchJSON("/api/scan", { method: "POST", body });
     if (res.error) {
       setStatus(res.error, true);
-      updateControls("idle");
+      updateControls(currentStatus);
       return;
     }
-    pollTimer = setInterval(poll, 1000);
-    poll();
+    currentScanId = res.scan_id || "";
+    resetResultViews();
+    ensurePolling();
   } catch (e) {
     setStatus("启动失败：" + e, true);
-    updateControls("idle");
+    updateControls(currentStatus);
   }
 });
 
@@ -168,12 +218,40 @@ $("apply-config").addEventListener("click", async () => {
   }
 });
 
-// ---------- 取消 ----------
+// ---------- 取消：立即中断，已抓到的结果保留 ----------
 $("cancel").addEventListener("click", async () => {
   try {
-    await fetchJSON("/api/scan/cancel", { method: "POST" });
-    setStatus("正在取消…");
-  } catch (e) {}
+    const res = await fetchJSON("/api/scan/cancel", { method: "POST" });
+    if (res.error) { setStatus(res.error, true); return; }
+    cancelSince = Date.now();
+    setStatus("正在取消…（即刻中断在飞请求，已抓到的结果保留）");
+    updateControls("cancelling");
+    ensurePolling();
+  } catch (e) {
+    setStatus("取消失败：" + e, true);
+  }
+});
+
+// ---------- 强制复位：不等收尾，立刻解除占用可重开 ----------
+$("reset").addEventListener("click", async () => {
+  const ok = confirm(
+    "强制复位：立即解除任务占用，不再等待后台收尾。\n" +
+    "被放弃的任务会自行把产物写到 reports-ui/<任务号>/。\n\n确定吗？"
+  );
+  if (!ok) return;
+  try {
+    const res = await fetchJSON("/api/scan/abandon", { method: "POST" });
+    if (res.error) { setStatus(res.error, true); return; }
+    currentStatus = "idle";
+    currentScanId = "";
+    cancelSince = 0;
+    resetResultViews();
+    updateControls("idle");
+    setStatus("已强制复位：确认模式与参数后即可开始新任务");
+    ensurePolling();
+  } catch (e) {
+    setStatus("复位失败：" + e, true);
+  }
 });
 
 // ---------- 轮询进度 ----------
@@ -213,9 +291,19 @@ async function poll() {
     setTabCount("nodes", s.total_nodes ?? 0);
     if (s.mode === "download") setTabCount("files", s.downloaded ?? 0);
 
+    // 换任务了（取消/复位后重开）：清空结果区与计时，避免上一个任务的数据串进来
+    if (s.scan_id !== currentScanId) {
+      currentScanId = s.scan_id || "";
+      if (s.scan_id) {
+        startedAt = Date.now();
+        resetResultViews();
+      }
+    }
+    liveMode = s.mode || liveMode;
+
     // 动态结果：运行中（含暂停/取消中）每 2s 渐进刷新结果表，
     // 完成后强制再全量刷新一次，杜绝"只有任务结束才有内容"。
-    const active = s.status === "running" || s.status === "paused" || s.status === "cancelling";
+    const active = isActive(s.status);
     const terminal = s.status === "done" || s.status === "error" || s.status === "cancelled";
     if (active || terminal) {
       const now = Date.now();
@@ -224,8 +312,21 @@ async function poll() {
         await loadResults();
       }
     }
-    setStatus(statusText(s.status));
+
     updateControls(s.status);
+    let text = statusText(s.status);
+    if (s.status === "cancelling") {
+      if (!cancelSince) cancelSince = Date.now();
+      const secs = Math.floor((Date.now() - cancelSince) / 1000);
+      if (secs >= 5) text = `取消中（已 ${secs}s）：仍在收尾，可直接点「强制复位」立刻解除占用`;
+    } else {
+      cancelSince = 0;
+    }
+    if (active && liveMode && liveMode !== currentMode) {
+      text += `　·　本任务=${liveMode === "download" ? "仅下载" : "审计"}` +
+              `，已选=${currentMode === "download" ? "仅下载" : "审计"}（点「放弃并重开」生效）`;
+    }
+    setStatus(text);
     if (terminal) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -237,10 +338,12 @@ async function poll() {
 }
 
 function statusText(s) {
-  return {
+  const map = {
     idle: "空闲", running: "扫描中…", paused: "已暂停", done: "完成",
-    error: "出错", cancelled: "已取消", cancelling: "取消中…",
-  }[s] || s;
+    error: "出错", cancelled: "已取消", cancelling: "取消中…", abandoned: "已放弃",
+  };
+  if (s === "running") return liveMode === "download" ? "下载中…" : "扫描中…";
+  return map[s] || s;
 }
 
 function syncInput(el, val) {
@@ -349,9 +452,15 @@ async function fetchJSON(url, opts) {
   return data;
 }
 function updateControls(status) {
-  const active = status === "running" || status === "paused" || status === "cancelling";
-  $("start").disabled = active;
-  $("cancel").style.display = active ? "" : "none";
+  const active = isActive(status);
+  const sbtn = $("start");
+  // 永远可点：运行中点击即"放弃当前任务并按现在的选择重开"
+  sbtn.disabled = false;
+  sbtn.textContent = active ? "放弃并重开" : (currentMode === "download" ? "开始下载" : "开始扫描");
+  sbtn.classList.toggle("primary", !active);
+  sbtn.title = active ? "放弃当前任务，按左侧模式/参数立刻重开" : "按左侧参数开始任务";
+  $("cancel").style.display = (status === "running" || status === "paused") ? "" : "none";
+  $("reset").style.display = active ? "" : "none";
   const pbtn = $("pause");
   const showPause = status === "running" || status === "paused";
   pbtn.style.display = showPause ? "" : "none";
@@ -364,6 +473,26 @@ function updateControls(status) {
   }
   $("apply-config").disabled = !(status === "running" || status === "paused");
   if (!active) startedAt = null;
+}
+
+// 复位后前端自己的轮询可能已经停了，这里确保它继续跑
+function ensurePolling() {
+  if (!pollTimer) pollTimer = setInterval(poll, 1000);
+  poll();
+}
+
+// 换任务时清空结果区、日志与进度条，杜绝新旧任务数据混在一起
+function resetResultViews() {
+  lastLiveLoad = 0;
+  renderFindings([]);
+  renderEndpoints([]);
+  renderNodes([]);
+  renderFiles([]);
+  $("files-dir").textContent = "";
+  $("log").textContent = "";
+  $("progress-fill").style.width = "0%";
+  $("progress-text").textContent = "0% · 完成 0 / 排队 0 / 发现 0";
+  ["findings", "endpoints", "nodes", "files"].forEach((n) => setTabCount(n, 0));
 }
 function setStatus(text, isError) {
   const el = $("m-status");

@@ -103,10 +103,14 @@ class Orchestrator:
         self._dl_lock = asyncio.Lock()
 
     # ---------- 暂停 / 恢复 / 动态调参（线程安全，均派发到事件循环） ----------
-    def cancel(self) -> bool:
-        """请求取消：置标志并排空队列（派发到事件循环执行，线程安全）。"""
+    def cancel(self, force: bool = True) -> bool:
+        """请求取消：置标志、排空队列，并中断在飞请求（派发到事件循环，线程安全）。
+
+        force=True 时同时取消所有 worker 正在 await 的操作（httpx 请求、CDP 渲染、
+        重试退避 sleep），取消因此秒级生效，而不是等当前节点自然收尾。
+        """
         self._cancel = True
-        return self._schedule(self._do_cancel)
+        return self._schedule(lambda: self._do_cancel(force))
 
     def pause(self) -> bool:
         """暂停：worker 处理完当前节点后挂起，队列与进度全部保留。"""
@@ -137,10 +141,17 @@ class Orchestrator:
             limiter.qps = q
         return True
 
-    async def _do_cancel(self) -> None:
+    async def _do_cancel(self, force: bool = True) -> None:
         self._cancel = True
         self._pause_event.set()  # 唤醒暂停中的 worker，让其看到取消标志后退出
         self._drain_queue()
+        if not force:
+            return
+        # 强制中断：worker 此时可能停在网络请求 / 浏览器渲染 / 退避 sleep 上，
+        # 直接 cancel 会让它立刻抛出 CancelledError 并走完 finally 收尾。
+        for w in self._workers:
+            if not w.done():
+                w.cancel()
 
     async def _do_pause(self) -> None:
         self._paused = True
@@ -278,8 +289,12 @@ class Orchestrator:
         self._workers = []
         seen = await self.store.load_seen_urls()
         self.dedup.seen_urls |= seen
-        if seen:
-            logger.info("断点续跑：已加载 %d 条历史 URL 记录", len(seen))
+        # 内容哈希也跨轮加载：相同内容不再重复写盘 / 不再重复送 LLM
+        contents = await self.store.load_seen_content_hashes()
+        self.dedup.audited_contents |= contents
+        if seen or contents:
+            logger.info("断点续跑：已加载 %d 条历史 URL、%d 条内容哈希记录",
+                        len(seen), len(contents))
         for seed in seeds:
             if "://" not in seed:
                 logger.warning("忽略非法种子：%s", seed)
@@ -295,20 +310,23 @@ class Orchestrator:
             return self.summary
         await self._sync_workers()
         # 等待队列排空；暂停时 worker 挂起在 _pause_event，join 持续等待属正常。
-        # 支持中途取消：cancel 会排空队列并唤醒暂停 worker。
-        while True:
-            try:
-                await asyncio.wait_for(self.queue.join(), timeout=0.5)
-                break
-            except asyncio.TimeoutError:
-                if self._cancel:
-                    self._drain_queue()
+        # 支持中途取消：cancel 会排空队列、唤醒暂停 worker 并中断在飞节点。
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(self.queue.join(), timeout=0.5)
                     break
-        # 结束：先置完成标志，阻止后续动态调参再派生 worker
-        self._finished = True
-        for w in self._workers:
-            w.cancel()
-        await asyncio.gather(*self._workers, return_exceptions=True)
+                except asyncio.TimeoutError:
+                    if self._cancel:
+                        self._drain_queue()
+                        break
+        finally:
+            # 正常结束或被取消：先置完成标志（阻止后续动态调参再派生 worker），
+            # 再确保所有 worker 退出；被中断的 worker 同样经此收尾，不留悬挂任务。
+            self._finished = True
+            for w in self._workers:
+                w.cancel()
+            await asyncio.gather(*self._workers, return_exceptions=True)
         return self.summary
 
     async def _enqueue(self, url: str, depth: int, source: str) -> bool:
@@ -335,7 +353,12 @@ class Orchestrator:
             await self._pause_event.wait()
             if self._cancel or wid >= self._concurrency:
                 return
-            url, depth, source = await self.queue.get()
+            # get 与 task_done 严格配对：取到任务才记账，取消点落在 get 上时
+            # 不会多减一次 pending，也不会让 queue.join() 的计数对不上。
+            try:
+                url, depth, source = await self.queue.get()
+            except asyncio.CancelledError:
+                raise
             try:
                 await self._process(url, depth, source)
             except asyncio.CancelledError:
@@ -380,6 +403,10 @@ class Orchestrator:
         # ===== 纯下载模式：只落盘 + 递归，跳过全部审计环节 =====
         if self.download_only:
             await self._save_to_disk(fr, kind)
+            # 渲染在下载模式同样生效：SPA 的动态 chunk 只在运行时才可见，
+            # 纯 httpx 抓不到（这里不做 JS Hook 记录，那些属于审计产物）。
+            if kind == "html":
+                await self._render_and_enqueue(fr, depth, audit=False)
             await self._recurse(fr, kind, depth)
             return
 
@@ -424,7 +451,15 @@ class Orchestrator:
             pf.findings.extend(json_cfg_findings)
             await self._record_local(fr.url, pf, depth)
 
-        # 增强渲染（三种模式）
+        await self._render_and_enqueue(fr, depth, audit=True, html=html, external=external)
+
+    async def _render_and_enqueue(self, fr, depth: int, audit: bool = True,
+                                  html: str = "", external: list[str] | None = None) -> None:
+        """增强渲染（三种模式）：CDP 拦截动态 JS + 可选 JS Hook 记录。
+
+        审计模式与纯下载模式共用同一条渲染路径：下载模式下只把拦截到的 JS
+        入队并落盘，不产生 hook 发现（那属于审计产物）。
+        """
         render_mode = getattr(self.cfg.scan, "render_mode", "hybrid")
         if not self.cfg.scan.render_enabled or render_mode == "off":
             return
@@ -432,39 +467,40 @@ class Orchestrator:
             return
         if not self.renderer.available():
             return
+        if not html:
+            html = decode(fr.body or b"")
+        if external is None:
+            external, _ = extract_scripts(html)
 
-        should_render = False
-        if render_mode == "full":
-            # 对所有 HTML 页面启用增强渲染（覆盖率最高）
-            should_render = True
-        elif render_mode == "hybrid":
-            # 仅对 SPA 空壳启用（默认，平衡覆盖率和速度）
-            should_render = is_spa_shell(html, external)
+        should_render = render_mode == "full" or is_spa_shell(html, external)
+        if not should_render:
+            return
 
-        if should_render:
-            logger.info("增强渲染 %s（模式：%s）：%s", render_mode, "SPA空壳" if render_mode == "hybrid" else "全量", fr.url)
-            self.summary.rendered += 1
-            rr = await self.renderer.render_and_collect(
-                fr.final_url, max_clicks=self.cfg.scan.render_max_clicks
-            )
-            if rr.error and not rr.js_urls:
-                self.summary.render_failures += 1
-                logger.warning("渲染失败：%s", rr.error)
-            # 记录 CDP 拦截到的 JS URL
-            self.summary.render_js_urls += len(rr.js_urls)
-            for js_url in rr.js_urls:
-                if depth + 1 <= self.cfg.scan.max_depth:
-                    await self._enqueue(js_url, depth + 1, f"cdp:{fr.url}")
-            # 记录 Hook 捕获的动态代码执行
-            self.summary.render_route_count += len(rr.routes)
-            for hf in rr.hook_findings:
-                htype = hf.get("type", "unknown")
-                code = hf.get("code", "") or hf.get("src", "") or hf.get("url", "")
-                if code:
-                    await self._record_finding(
-                        fr.url, f"hook_{htype}", "low", str(code)[:512], "", 0.3,
-                        f"JS Hook 捕获：{htype}"
-                    )
+        logger.info("增强渲染 %s（模式：%s）：%s", render_mode,
+                    "全量" if render_mode == "full" else "SPA空壳", fr.url)
+        self.summary.rendered += 1
+        rr = await self.renderer.render_and_collect(
+            fr.final_url, max_clicks=self.cfg.scan.render_max_clicks
+        )
+        if rr.error and not rr.js_urls:
+            self.summary.render_failures += 1
+            logger.warning("渲染失败：%s", rr.error)
+        # CDP 拦截到的 JS URL：入队继续抓取（下载模式下即落盘）
+        self.summary.render_js_urls += len(rr.js_urls)
+        for js_url in rr.js_urls:
+            if depth + 1 <= self.cfg.scan.max_depth:
+                await self._enqueue(js_url, depth + 1, f"cdp:{fr.url}")
+        self.summary.render_route_count += len(rr.routes)
+        if not audit:
+            return
+        for hf in rr.hook_findings:
+            htype = hf.get("type", "unknown")
+            snippet = hf.get("code", "") or hf.get("src", "") or hf.get("url", "")
+            if snippet:
+                await self._record_finding(
+                    fr.url, f"hook_{htype}", "low", str(snippet)[:512], "", 0.3,
+                    f"JS Hook 捕获：{htype}"
+                )
 
     async def _handle_js(self, fr, depth: int) -> None:
         text = decode(fr.body)

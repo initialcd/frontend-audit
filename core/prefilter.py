@@ -98,7 +98,7 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern]] = [
             r"""(?i)(?:lat|lng|longitude|latitude|coord)["'`]?\s*[:=]\s*["'`]?(-?\d{1,3}\.\d{4,10})"""
         ),
     ),
-    # --- 国内云服务凭证（实测样本：weshine SCRM 前端泄露腾讯创意云密钥）---
+    # --- 国内云服务凭证（实测样本：某 SCRM 系统前端泄露腾讯创意云密钥）---
     # 腾讯云创意云 APPID：cc + 14位数字（如 cc20210224145031）
     ("creative_cloud_appid", "high", re.compile(r"\bcc\d{14}\b")),
     # 腾讯云创意云 SECRET：cc + 小写字母数字 25-40 位（如 ccjktx6spz7ys26643q9z15urjh183c1）
@@ -110,7 +110,7 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern]] = [
     # 腾讯云 COS/API SecretId 变体：AKID 之外的其他腾讯云格式
     ("tencent_other_secret", "critical", re.compile(r"\bAK[0-9A-Za-z]{20,}\b")),
     # --- 企业微信/微信生态凭证 ---
-    # 企业微信 corpid/appid：ww + 16位十六进制（如 wwf336afe442d36264）
+    # 企业微信 corpid/appid：ww + 16位十六进制（如 ww0123456789abcdef）
     ("wecom_corpid", "high", re.compile(r"\bww[a-f0-9]{16}\b")),
     # 企业微信 agentId 声明：agentId = 4-10位数字
     ("wecom_agentid", "high", re.compile(r"""(?i)agentid["']?\s*[:=]\s*["']?(\d{4,10})""")),
@@ -569,7 +569,7 @@ def detect_json_config_secrets(text: str) -> list[LocalFinding]:
 # ---------- 签名机制 / 请求保护逻辑检测 ----------
 # 前端出现"自定义签名头 + 拦截器注入 + hash 算法"组合时，说明整个 API 网关的
 # 签名/防篡改算法暴露在客户端 JS 中，可被逆向并随意伪造——这是高价值逻辑型发现
-# （区别于上面的值型密钥泄露）。参考样本：weshine SCRM 的 paramsHandler.js。
+# （区别于上面的值型密钥泄露）。参考样本：某 SCRM 系统的 paramsHandler.js。
 SIGN_HEADER_RE = re.compile(r"""["']x-[a-z0-9_-]*signature["']""", re.I)
 MD5_CALL_RE = re.compile(r"\bmd5\s*\(", re.I)
 SHA_CALL_RE = re.compile(r"\b(?:sha1|sha256|sha512)\s*\(", re.I)

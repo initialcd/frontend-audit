@@ -1,0 +1,32 @@
+# 渲染/下载链路验证专用配置：独立状态库与产物目录，不碰主 config.yaml 与 state.db。
+# 用法示例：
+#   python -m http.server 8888 --bind 127.0.0.1     # 在 tests/spa_site 下启动
+#   python main.py --download -u http://127.0.0.1:8888/ -c config.spa-test.yaml --render off    --fresh -o dump-off
+#   python main.py --download -u http://127.0.0.1:8888/ -c config.spa-test.yaml --render hybrid --fresh -o dump-on
+deepseek:
+  api_key: ""
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-v4-flash"
+
+scan:
+  concurrency: 4
+  per_domain_qps: 0            # 0 = 不限速，本地验证用
+  timeout: 10
+  retries: 0
+  max_depth: 3
+  llm_enabled: false           # 本地验证不调 LLM
+  verify_tls: false            # 本地 http 站点
+  render_enabled: true
+  render_mode: "hybrid"
+  render_max_clicks: 5
+
+scope:
+  domains: ["127.0.0.1"]
+  allow_subdomains: true
+
+proxy:
+  enabled: false
+
+storage:
+  db_path: "state-spa-test.db"
+  output_dir: "reports-spa"

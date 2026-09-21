@@ -79,16 +79,16 @@ def test_parse_domains_multi_separators():
 
 
 def test_multi_domain_scope_all_groups_match():
-    domains = ["jxnu.edu.cn", "example.com"]
-    assert is_in_scope("https://stuworkyx.jxnu.edu.cn/xxl-job-admin/", domains)
+    domains = ["example.org", "example.com"]
+    assert is_in_scope("https://sub.example.org/app/", domains)
     assert is_in_scope("https://www.example.com/app.js", domains)
     assert not is_in_scope("https://other.org/x", domains)
 
 
 def test_is_in_scope_with_dirty_entries():
     # 用户把完整 URL / 带端口地址直接粘进白名单也能匹配
-    assert is_in_scope("https://a.jxnu.edu.cn/x", ["https://jxnu.edu.cn", "example.com"])
-    assert is_in_scope("https://www.example.com/x", ["jxnu.edu.cn", "example.com:8080"])
+    assert is_in_scope("https://a.example.org/x", ["https://example.org", "example.com"])
+    assert is_in_scope("https://www.example.com/x", ["example.org", "example.com:8080"])
 
 
 def test_primary_domain_longest_match():

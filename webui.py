@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +31,7 @@ from core.fetcher import Fetcher
 from core.normalizer import parse_domains
 from core.orchestrator import Orchestrator
 from core.proxy_pool import ProxyPool
+from core.renderer import Renderer
 from storage.db import Store
 from storage.reporter import write_reports
 
@@ -41,12 +43,20 @@ logger = logging.getLogger("webui")
 
 # ---------- 日志缓冲 ----------
 class MemoryHandler(logging.Handler):
-    def __init__(self, buf: deque):
+    """按线程收集日志：每个任务跑在独立线程，只收本线程的记录。
+
+    否则旧任务被放弃后仍在收尾，它的日志会串进新任务的日志面板。
+    """
+
+    def __init__(self, buf: deque, thread_id: int | None = None):
         super().__init__()
         self.buf = buf
+        self.thread_id = thread_id
         self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
 
     def emit(self, record):
+        if self.thread_id is not None and record.thread != self.thread_id:
+            return
         try:
             self.buf.append(self.format(record))
         except Exception:  # noqa: BLE001
@@ -54,12 +64,15 @@ class MemoryHandler(logging.Handler):
 
 
 # ---------- 扫描状态 ----------
+ACTIVE_STATUSES = ("running", "paused", "cancelling")
+
+
 class ScanState:
-    def __init__(self):
-        self.scan_id = ""
-        self.status = "idle"  # idle|running|paused|cancelling|done|error|cancelled
+    def __init__(self, scan_id: str = "", mode: str = "audit"):
+        self.scan_id = scan_id
+        self.status = "idle"  # idle|running|paused|cancelling|done|error|cancelled|abandoned
         self.params: dict = {}
-        self.mode = "audit"   # audit | download
+        self.mode = mode       # audit | download
         self.started_monotonic = 0.0
         self.summary: dict = {}
         self.logs: deque = deque(maxlen=400)
@@ -69,12 +82,19 @@ class ScanState:
         self.files: list = []          # 下载模式：已落盘文件清单
         self.report_dir: str = ""
         self.download_dir: str = ""    # 下载模式：输出目录绝对路径
+        self.db_path: str = ""         # 本任务独占的状态库（任务间不共享，重开即全新）
         self.error: str = ""
         self.orch: Orchestrator | None = None
+        self.thread: threading.Thread | None = None
+        # 取消请求：在 orch 尚未建好（线程启动窗口）时也能被 _async 读到并立即执行
+        self.cancel_requested = False
+        self.cancel_requested_at = 0.0
+        # 被"强制复位"放弃：其线程继续自行收尾，但已不是当前任务，前端不再读它
+        self.abandoned = False
 
     def live_snapshot(self) -> dict:
         # 运行中读 orchestrator 的实时计数器（跨线程读 int 字段，GIL 下安全）
-        if self.status in ("running", "paused", "cancelling") and self.orch is not None:
+        if self.status in ACTIVE_STATUSES and self.orch is not None:
             try:
                 s = dataclasses.asdict(self.orch.summary)
             except Exception:  # noqa: BLE001
@@ -107,6 +127,13 @@ class ScanState:
         s["scan_id"] = self.scan_id
         s["mode"] = self.mode
         s["download_dir"] = self.download_dir
+        s["report_dir"] = self.report_dir
+        s["cancel_requested"] = self.cancel_requested
+        s["abandoned"] = self.abandoned
+        s["cancelling_seconds"] = (
+            round(time.monotonic() - self.cancel_requested_at, 1)
+            if self.status == "cancelling" and self.cancel_requested_at else 0
+        )
         s["elapsed"] = int(time.monotonic() - self.started_monotonic) if self.started_monotonic else 0
         s["logs"] = list(self.logs)
         return s
@@ -116,34 +143,102 @@ class ScanManager:
     def __init__(self, base_cfg: Config):
         self.base_cfg = base_cfg
         self.state = ScanState()
-        self._lock = threading.Lock()
+        self.archived: list[dict] = []   # 被放弃任务的摘要（仅保留最近几条）
+        self._lock = threading.RLock()
 
     @property
     def running(self) -> bool:
-        return self.state.status in ("running", "paused", "cancelling")
+        return self.state.status in ACTIVE_STATUSES
 
-    def start(self, params: dict) -> dict:
+    @property
+    def can_start(self) -> bool:
+        return self.state.status not in ACTIVE_STATUSES
+
+    def start(self, params: dict, force: bool = False) -> dict:
         with self._lock:
             if self.running:
-                return {"error": "已有扫描正在运行"}
-        state = ScanState()
-        state.scan_id = time.strftime("%Y%m%d-%H%M%S")
-        state.params = params
-        state.mode = "download" if params.get("mode") == "download" else "audit"
-        state.status = "running"
-        state.started_monotonic = time.monotonic()
-        self.state = state
-        t = threading.Thread(target=self._run, args=(state, params), daemon=True)
-        t.start()
-        return {"scan_id": state.scan_id, "status": "running"}
+                if not force:
+                    return {"error": "已有任务在运行：请先「取消」，或点「放弃并重开」"}
+                # 抢占：放弃旧任务（其线程自行收尾，产物保留），再开新任务
+                self._abandon_locked("被新任务抢占")
+            self._cleanup_orphan_dbs_locked()
+            state = ScanState()
+            state.scan_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+            state.params = params
+            state.mode = "download" if params.get("mode") == "download" else "audit"
+            state.status = "running"
+            state.started_monotonic = time.monotonic()
+            self.state = state
+            t = threading.Thread(target=self._run, args=(state, params), daemon=True)
+            state.thread = t
+            t.start()
+            return {"scan_id": state.scan_id, "status": "running", "mode": state.mode}
 
     def cancel(self) -> dict:
-        if not self.running:
-            return {"status": "idle"}
-        if self.state.orch is not None:
-            self.state.orch.cancel()
-        self.state.status = "cancelling"
-        return {"status": "cancelling"}
+        """请求取消当前任务：中断在飞请求，秒级停下，进度与已入库结果全部保留。"""
+        with self._lock:
+            st = self.state
+            if st.status not in ACTIVE_STATUSES and not st.cancel_requested:
+                return {"status": st.status}
+            st.cancel_requested = True
+            st.cancel_requested_at = time.monotonic()
+            st.status = "cancelling"
+            st.logs.append("[*] 已请求取消：正在中断在飞请求与任务队列…")
+            orch = st.orch
+        # 锁外调用：orch.cancel 会派发到扫描事件循环，不在这里阻塞 HTTP 线程
+        if orch is not None:
+            orch.cancel(force=True)
+        return {"status": "cancelling", "scan_id": st.scan_id}
+
+    def abandon(self) -> dict:
+        """强制复位：不等旧任务收尾，立刻把当前状态换回 idle，可以马上重开。
+
+        旧线程继续在后台把产物写完（各自独立的库/目录，互不干扰），
+        只是不再是"当前任务"。
+        """
+        with self._lock:
+            if self.state.status not in ACTIVE_STATUSES:
+                return {"status": self.state.status, "can_start": True}
+            old = self._abandon_locked("用户强制复位")
+        return {"status": "idle", "abandoned": old.scan_id, "can_start": True}
+
+    def _abandon_locked(self, reason: str) -> ScanState:
+        """标记旧任务被放弃并归档，切换到全新的空闲状态（调用方需持锁）。"""
+        st = self.state
+        st.abandoned = True
+        st.cancel_requested = True
+        if st.status in ACTIVE_STATUSES:
+            st.status = "abandoned"
+        st.logs.append(f"[!] 任务被放弃（{reason}）：后台线程自行收尾，"
+                       f"已抓取的数据与报告保留在 reports-ui/{st.scan_id}/")
+        st.cancel_requested_at = st.cancel_requested_at or time.monotonic()
+        self.archived.append({
+            "scan_id": st.scan_id,
+            "mode": st.mode,
+            "reason": reason,
+            "report_dir": st.report_dir,
+            "download_dir": st.download_dir,
+        })
+        self.archived = self.archived[-5:]
+        self.state = ScanState()
+        if st.orch is not None:
+            st.orch.cancel(force=True)
+        return st
+
+    def _cleanup_orphan_dbs_locked(self) -> None:
+        """清理历史任务遗留的独立状态库；仍被旧线程占用的跳过（Windows 下删除会失败）。
+
+        每个任务用 state-ui-<scan_id>.db，重开即全新库，绝不会把上一轮的
+        URL 记录当成"已抓过"从而把新任务判成空跑。
+        """
+        keep = self.state.db_path
+        for p in Path(".").glob("state-ui-*.db*"):
+            if keep and str(p) == keep:
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     def pause(self) -> dict:
         if self.state.status != "running":
@@ -222,16 +317,20 @@ class ScanManager:
         ) if not download_only else False
         cfg.scan.audit_json = bool(params.get("audit_json", False)) and not download_only
         cfg.proxy.enabled = bool(params.get("proxy", False))
+        # 渲染：UI 的 render_mode 即总开关（选 off 就是关，选 hybrid/full 就开），
+        # 避免 config.yaml 里 render_enabled=false 时"选了模式却不生效"的困惑
         cfg.scan.render_mode = str(params.get("render_mode", cfg.scan.render_mode))
+        cfg.scan.render_enabled = cfg.scan.render_mode != "off"
+        # TLS 校验：内网/政企/银行站点常用自签或私有 CA 证书，开着校验会整站抓不到
+        if "verify_tls" in params:
+            cfg.scan.verify_tls = bool(params["verify_tls"])
         cfg.scope.domains = list(params.get("domains", []))
-        # 每次 UI 扫描用全新状态库（独立、可复现；不与 CLI 的 state.db 互相干扰）
-        for p in Path(".").glob("state-ui.db*"):
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
-                pass
-        cfg.storage.db_path = "state-ui.db"
-        cfg.storage.output_dir = "reports-ui"
+        # 每个任务独占一套状态库与报告目录（含 scan_id）。旧任务被取消/放弃后
+        # 无论是否收尾完毕，都不会污染新任务：新库是空的，种子一定会被真正抓取。
+        db_path = f"state-ui-{state.scan_id}.db"
+        cfg.storage.db_path = db_path
+        state.db_path = db_path
+        cfg.storage.output_dir = f"reports-ui/{state.scan_id}"
 
         # 下载模式输出目录：沿用 _url_to_filepath 结构（<dir>/<host>/<path>）
         if download_only:
@@ -242,7 +341,7 @@ class ScanManager:
             dl_dir.mkdir(parents=True, exist_ok=True)
             state.download_dir = str(dl_dir)
 
-        handler = MemoryHandler(state.logs)
+        handler = MemoryHandler(state.logs, thread_id=threading.get_ident())
         root = logging.getLogger()
         # 运行时也把 httpx 的 INFO 日志收进来（可见请求进度）
         root.setLevel(logging.INFO)
@@ -258,6 +357,27 @@ class ScanManager:
             orch.download_only = True
             orch.download_dir = Path(state.download_dir)
         state.orch = orch
+        # 渲染与 TLS 是"开了却没生效"最容易困惑的两项，开工前明确讲清状态
+        if not cfg.scan.render_enabled:
+            state.logs.append("[*] 增强渲染：关闭（纯 httpx 模式）")
+        elif not orch.renderer.available():
+            state.logs.append("[!] 增强渲染已选 " + cfg.scan.render_mode +
+                              "，但 Playwright 未安装 → 本次会静默跳过渲染"
+                              "（安装：pip install playwright && python -m playwright install chromium）")
+        elif not orch.renderer.browser_ready():
+            state.logs.append("[!] 增强渲染已选 " + cfg.scan.render_mode +
+                              "，Playwright 包在但浏览器内核未下载 → 首次渲染会失败并降级"
+                              "（补：python -m playwright install chromium）")
+        else:
+            state.logs.append("[*] 增强渲染：" + cfg.scan.render_mode +
+                              ("（对所有 HTML 页面）" if cfg.scan.render_mode == "full" else "（仅 SPA 空壳）"))
+        if not cfg.scan.verify_tls:
+            state.logs.append("[*] TLS 证书校验：已关闭")
+        # 竞态兜底：取消请求可能落在"线程已起、orch 还没建好"的窗口里，
+        # 那时 nobody 能通知 orch；这里补执行，避免取消丢单、任务照跑到底。
+        if state.cancel_requested:
+            orch.cancel(force=True)
+            state.logs.append("[*] 取消请求在启动阶段到达：已立即中断任务")
         if download_only:
             state.logs.append(f"[*] 开始下载：种子 {len(params.get('seeds', []))} 个，"
                               f"白名单 {cfg.scope.domains}，深度 {cfg.scan.max_depth}，"
@@ -279,6 +399,7 @@ class ScanManager:
                 await self._materialize(state, store)
             summary = await scan_task
             state.summary = dataclasses.asdict(summary)
+            cancelled = bool(orch._cancel or state.cancel_requested)
             # 最终全量刷新一次，保证 done 后数据完整
             await self._materialize(state, store)
             if download_only:
@@ -286,15 +407,22 @@ class ScanManager:
                 state.files = self._collect_files(state.download_dir)
                 state.report_dir = await self._write_download_manifest(state)
             else:
-                out = await write_reports(cfg, store, summary)
-                state.report_dir = str(out)
-            state.status = "cancelled" if orch._cancel else "done"
+                # 取消后仍落一份报告：已抓到的发现不白费；失败不影响终态判定
+                try:
+                    out = await write_reports(cfg, store, summary)
+                    state.report_dir = str(out)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("报告生成失败：%s", exc)
+                    state.logs.append(f"[!] 报告生成失败：{exc!r}")
+            state.status = "cancelled" if cancelled else "done"
             if download_only:
                 state.logs.append(f"[*] 下载{state.status}：成功 {summary.downloaded}，"
                                   f"失败 {summary.download_failed}，目录 {state.download_dir}")
             else:
                 state.logs.append(f"[*] 扫描{state.status}：{state.summary.get('findings',0)} 条发现，"
                                   f"{state.summary.get('endpoints',0)} 个接口")
+            if state.status == "cancelled":
+                state.logs.append("[*] 任务已结束，现在可以重新选择模式/参数后直接开始新任务")
         except asyncio.CancelledError:
             state.status = "cancelled"
             if download_only and state.download_dir:
@@ -421,7 +549,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             return self._json(self._config_view())
         if path == "/api/scan/status":
-            return self._json(MGR.state.live_snapshot())
+            snap = MGR.state.live_snapshot()
+            # can_start：当前是否可以直接开新任务（取消中也可强制重开）
+            snap["can_start"] = MGR.can_start
+            snap["archived"] = MGR.archived[-3:]
+            return self._json(snap)
         if path == "/api/scan/findings":
             return self._json({"findings": MGR.state.findings})
         if path == "/api/scan/endpoints":
@@ -432,7 +564,7 @@ class Handler(BaseHTTPRequestHandler):
             # 下载模式：实时枚举落盘文件（运行中也能看进度）
             rows = MGR.state.files
             if MGR.state.mode == "download" and MGR.state.download_dir:
-                if MGR.state.status in ("running", "paused", "cancelling"):
+                if MGR.state.status in ACTIVE_STATUSES:
                     rows = ScanManager._collect_files(MGR.state.download_dir)
             return self._json({"files": rows, "dir": MGR.state.download_dir})
         if path == "/api/scan/report":
@@ -454,6 +586,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_start(params)
         if path == "/api/scan/cancel":
             return self._json(MGR.cancel())
+        if path == "/api/scan/abandon":
+            # 强制复位：不等旧任务收尾，立刻解除占用，可马上换模式重开
+            return self._json(MGR.abandon())
         if path == "/api/scan/pause":
             return self._json(MGR.pause())
         if path == "/api/scan/resume":
@@ -476,7 +611,9 @@ class Handler(BaseHTTPRequestHandler):
         params["seeds"] = seeds
         params["domains"] = domains
         params["mode"] = mode
-        res = MGR.start(params)
+        # force=True：运行中直接抢占（放弃旧任务后开新任务），供"放弃并重开"用
+        force = bool(params.get("force"))
+        res = MGR.start(params, force=force)
         self._json(res, 200 if "error" not in res else 409)
 
     def _serve_report(self, fmt: str) -> None:
@@ -511,6 +648,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _config_view(self) -> dict:
         cfg = MGR.base_cfg
+        renderer = Renderer(cfg)
         return {
             "max_depth": cfg.scan.max_depth,
             "concurrency": cfg.scan.concurrency,
@@ -520,6 +658,10 @@ class Handler(BaseHTTPRequestHandler):
             "audit_json": cfg.scan.audit_json,
             "proxy_enabled": cfg.proxy.enabled,
             "render_mode": cfg.scan.render_mode,
+            # 包与浏览器内核都就绪才算真的能渲染；否则页面直接给出提示，
+            # 避免"选了 hybrid 却什么都没发生"
+            "render_ready": renderer.available() and renderer.browser_ready(),
+            "verify_tls": cfg.scan.verify_tls,
             # 离线可用性：下载模式永远可离线；审计模式在无 Key 时自动降级为纯本地正则
             "network_required": False,
             "offline_ready": True,

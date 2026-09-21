@@ -23,12 +23,26 @@
 pip install -r requirements.txt
 ```
 
-需要 SPA 动态渲染时，额外安装 Playwright 浏览器：
+需要 SPA 动态渲染时，额外安装 Playwright 浏览器（**注意：装包 ≠ 能渲染**，两步都要做，否则渲染会在运行时降级为纯 httpx，且 SPA 的动态 chunk 一个都抓不到）：
 
 ```bash
 pip install playwright
-python -m playwright install chromium
+python -m playwright install chromium     # 下载 chromium 与 headless shell，约 140MB
 ```
+
+装完按顺序自检，从"依赖装没装齐"到"功能是否真的可用"：
+
+```bash
+python -c "import httpx,pydantic,yaml;print('依赖就绪')"   # 1. 运行依赖
+python -m pytest -q                                        # 2. 单元测试（预期 41 项通过）
+python tests/probe_llm.py                                  # 3. DeepSeek 链路：模型名 / Key / JSON 输出
+python tests/probe_llm_budget.py                           # 4. token 预算与并发稳定性
+python tests/probe_webui_restart.py                        # 5. 取消 / 重开 / 强制复位
+```
+
+第 5 项需要先在 `tests/smoke_site` 下起一个静态站（`python -m http.server 8877 --bind 127.0.0.1`）并运行 `webui.py`，细节见该脚本头部注释。
+
+增强渲染是否真的就绪，CLI 与 Web UI 都会在任务开始时明确打印状态：判断依据是「包能 import」+「`ms-playwright` 下存在 chromium 内核目录」两级，任何一级缺失都会直接说明，不再静默跳过。
 
 ## 配置
 
@@ -134,7 +148,19 @@ python main.py --download -u targets.txt --domains example.com -o ./dump -d 3
 | `--audit-json` | 关 | JSON 内容也送 LLM 审计 |
 | `--download` | 关 | 下载模式 |
 | `-o` / `--output` | `downloads` | 下载模式输出目录 |
+| `--render` | 配置值 | 增强渲染模式：`off` / `hybrid` / `full` |
+| `--fresh` | 关 | 清空历史状态库后从零重扫（不加则重跑同一目标会因命中去重记录而显示「成功 0」） |
 | `-v` / `--verbose` | 关 | 输出 DEBUG 日志 |
+
+CLI 的 `--download` 与 Web UI 的仅下载模式**走同一套 Orchestrator 引擎**（`download_only=True`），能力完全一致：增强渲染、节点预算控制、统一的 URL 规范化与去重都生效。因此 CLI 下载同样能通过渲染抓到 SPA 运行时动态加载的 chunk，而纯 httpx 是抓不到的。
+
+```bash
+# 同一个目标想重扫：必须加 --fresh，否则全部命中历史去重记录，结果是"成功 0"
+python main.py --download -u urls.txt --domains example.com --fresh -o ./dump
+
+# SPA 站点想抓运行时 chunk：开启渲染（先确认 Playwright 内核已装）
+python main.py --download -u https://spa.example.com --domains example.com --render hybrid -o ./dump
+```
 
 ## Web UI 用法
 
@@ -146,21 +172,39 @@ python webui.py -c config.local.yaml   # 指定配置
 
 页面左上角先选运行模式，两种模式共用同一套递归引擎。
 
-仅下载是默认项，离线可用。它只做递归抓取存盘，不审计、不调 LLM、不需要 API Key，界面显示「进度 / 节点 / 文件」三个选项卡，可指定输出目录。
+仅下载是默认项，离线可用。它只做递归抓取存盘，不审计、不调 LLM、不需要 API Key，界面显示「进度 / 节点 / 文件」三个选项卡，可指定输出目录。下载模式同样支持增强渲染：SPA 运行时才加载的 chunk 只有渲染才能发现。
 
 审计模式在抓取基础上做敏感信息审计和接口发现，显示「发现 / 接口 / 节点」选项卡，完成后可下载 `report.md` 与 `full.json`。未配置 API Key 时页面会提示将自动降级为纯本地正则，效果等同 CLI 的 `--no-llm`。
 
+两项容易踩的配置在页面上都有明确提示：
+
+- **增强渲染模式**：下拉框下方实时显示该选项当前是否真的生效。Playwright 包或浏览器内核任一缺失，都会直接标红说明并给出安装命令。
+- **校验 TLS 证书**：内网 / 政企 / 银行站点常用自签或私有 CA 证书，勾着这一项会整站抓不到（节点 0、下载 0），取消勾选即可正常抓取。
+
 两种模式都支持运行中改并发和深度并即时应用、暂停继续、取消。下载完成后在「文件」选项卡查看落盘清单，可导出 JSON 或 TXT，同时在输出目录写入 `_manifest.json`。
+
+### 取消 / 换模式重开
+
+模式选错或参数不对时，不必重启工具，也不必等任务收尾：
+
+- **取消**：立刻中断所有在飞请求（HTTP 请求、浏览器渲染、重试退避都算在飞），秒级停下；已抓到的节点、发现、接口全部保留，并照常落一份报告到 `reports-ui/<任务号>/`。
+- **放弃并重开**：运行中直接点主按钮（此时文案变为「放弃并重开」）并确认，旧任务转入后台自行收尾，同时按左侧当前的模式与参数立刻启动新任务。这是修模式选错的主路径。
+- **强制复位**：极端情况下（例如浏览器渲染卡死）取消迟迟不返回，点「强制复位」立即解除任务占用，恢复空闲态，随后可随意重开。
+- 换任务时前端自动清空「发现 / 接口 / 节点 / 文件」与日志，不会把两个任务的结果混在一起显示。
+
+每个任务独占一套状态库 `state-ui-<任务号>.db` 与报告目录 `reports-ui/<任务号>/`，因此重开一定是全新一轮抓取，不会因为上一轮的 URL 记录被判重而空跑。历史状态库在新任务启动时自动清理，被旧线程占用的跳过，不影响新任务。
 
 ### 离线环境
 
 不通外网时按下面配置：
 
 1. 模式选仅下载，全程不触碰 LLM，不需要任何 Key。
-2. 增强渲染选 `off`，否则会因缺少 Playwright 浏览器而空等。
+2. 增强渲染选 `off`。没装 Playwright 时选 hybrid/full 不会拖慢任务（检测到缺包会直接跳过并在日志里打印状态），但也不会真的渲染；装了包却没下内核时，首次渲染会尝试启动浏览器、失败一次后自动降级。
 3. 确实需要审计能力时，选审计模式但不勾选 LLM，纯本地正则，零外网依赖。
 
-Web UI 每次任务使用独立的 `state-ui.db` 并在启动时清理，不做跨次断点续跑；CLI 的 `state.db` 则持久保留。同一个 URL 在 CLI 下重复执行会因去重而显示"成功 0"，属预期行为，想全量重跑请删除 `state.db`。
+Web UI 每个任务用独立的状态库 `state-ui-<任务号>.db`（启动新任务时清理历史文件），不做跨次断点续跑，重开即全新一轮；CLI 的 `state.db` 则持久保留。同一个 URL 在 CLI 下重复执行会因去重而显示"成功 0"，属预期行为，想全量重跑请删除 `state.db`。
+
+界面上的取消 / 换模式重开行为可以用 `tests/probe_webui_restart.py` 一键回归（需先起 `webui.py` 与 `tests/smoke_site`），脚本自带的慢站会验证取消确实中断了在飞请求。
 
 ## 递归 vs 目录爆破
 

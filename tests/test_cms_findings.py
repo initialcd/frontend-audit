@@ -1,4 +1,4 @@
-"""验证新增规则能覆盖今天（Drupal 靶标）的全部发现。"""
+"""验证 CMS 敏感路径与源码暴露规则（用例域名一律使用 example.com 占位）。"""
 from core.prefilter import (
     analyze_url_for_cms_findings,
     detect_json_config_secrets,
@@ -11,7 +11,7 @@ from core.prefilter import (
 def test_cms_sensitive_paths_composer_json():
     """composer.json 依赖声明泄露。"""
     findings = analyze_url_for_cms_findings(
-        "https://www.haifeng.4001961200.com/composer.json"
+        "https://www.example.com/composer.json"
     )
     assert findings, "composer.json 应命中 CMS 敏感路径"
     assert findings[0].ftype == "dependency_file"
@@ -21,7 +21,7 @@ def test_cms_sensitive_paths_composer_json():
 def test_cms_sensitive_paths_installed_json():
     """installed.json 精确版本泄露。"""
     findings = analyze_url_for_cms_findings(
-        "https://www.haifeng.4001961200.com/vendor/composer/installed.json"
+        "https://www.example.com/vendor/composer/installed.json"
     )
     assert findings, "installed.json 应命中"
     assert findings[0].ftype == "dependency_file"
@@ -31,7 +31,7 @@ def test_cms_sensitive_paths_installed_json():
 def test_cms_sensitive_paths_settings_php():
     """Drupal settings.php 泄露。"""
     findings = analyze_url_for_cms_findings(
-        "https://www.haifeng.4001961200.com/sites/default/settings.php"
+        "https://www.example.com/sites/default/settings.php"
     )
     assert findings, "settings.php 应命中"
     assert findings[0].ftype == "cms_config"
@@ -41,9 +41,9 @@ def test_cms_sensitive_paths_settings_php():
 def test_cms_sensitive_paths_theme_source():
     """Drupal 主题源码/配置泄露。"""
     for url in (
-        "https://www.haifeng.4001961200.com/themes/szrcb/szrcb.info.yml",
-        "https://www.haifeng.4001961200.com/themes/szrcb/szrcb.theme",
-        "https://www.haifeng.4001961200.com/themes/szrcb/szrcb.libraries.yml",
+        "https://www.example.com/themes/custom/custom.info.yml",
+        "https://www.example.com/themes/custom/custom.theme",
+        "https://www.example.com/themes/custom/custom.libraries.yml",
     ):
         findings = analyze_url_for_cms_findings(url)
         assert findings, f"{url} 应命中主题源码规则"
@@ -52,7 +52,7 @@ def test_cms_sensitive_paths_theme_source():
 def test_cms_sensitive_paths_vendor_bin():
     """vendor/bin/drush 暴露。"""
     findings = analyze_url_for_cms_findings(
-        "https://www.haifeng.4001961200.com/vendor/bin/drush"
+        "https://www.example.com/vendor/bin/drush"
     )
     assert findings, "vendor/bin 应命中"
     assert findings[0].ftype == "binary_exposure"
@@ -61,7 +61,7 @@ def test_cms_sensitive_paths_vendor_bin():
 def test_cms_sensitive_paths_bootstrap_inc():
     """bootstrap.inc 源码泄露（nginx 配置错误）。"""
     findings = analyze_url_for_cms_findings(
-        "https://www.haifeng.4001961200.com/core/includes/bootstrap.inc"
+        "https://www.example.com/core/includes/bootstrap.inc"
     )
     assert findings, "bootstrap.inc 应命中 source_disclosure"
     assert findings[0].ftype == "source_disclosure"
@@ -91,7 +91,7 @@ class DrupalKernel {
 """
     findings = detect_source_code_exposure(
         php_source,
-        "https://www.haifeng.4001961200.com/core/includes/bootstrap.inc",
+        "https://www.example.com/core/includes/bootstrap.inc",
         "text/plain",
     )
     assert findings, "PHP 源码特征应被检测为源码泄露"
@@ -108,7 +108,7 @@ def test_source_code_exposure_no_false_positive():
     ).encode("utf-8")
     findings = detect_source_code_exposure(
         html,
-        "https://www.haifeng.4001961200.com/",
+        "https://www.example.com/",
         "text/html",
     )
     assert findings == [], "普通 HTML 不应误报源码泄露"
