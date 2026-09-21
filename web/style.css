@@ -125,3 +125,33 @@ td { word-break: break-all; }
 .muted { color: var(--muted); }
 .empty { color: var(--muted); padding: 20px; text-align: center; }
 .dl-row { margin-bottom: 12px; }
+
+/* ---- 模式选择器 ---- */
+.mode-picker { display: flex; flex-direction: column; gap: 8px; }
+.mode-card {
+  display: flex; align-items: flex-start; gap: 9px; cursor: pointer;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel2); margin: 0; transition: border-color .15s, background .15s;
+}
+.mode-card:hover { border-color: var(--accent); }
+.mode-card.active {
+  border-color: var(--accent); background: rgba(47, 111, 216, .07);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.mode-card input { width: auto; margin: 3px 0 0; flex: none; }
+.mode-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.mode-desc { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+.tag-offline, .tag-llm {
+  font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 8px;
+  margin-left: 5px; vertical-align: 1px;
+}
+.tag-offline { background: rgba(26, 161, 126, .15); color: var(--ok); }
+.tag-llm { background: rgba(168, 107, 0, .15); color: var(--med); }
+
+/* ---- 离线提示条 ---- */
+.offline-note {
+  margin-bottom: 14px; padding: 9px 11px; border-radius: 7px; font-size: 12px;
+  line-height: 1.55; background: rgba(26, 161, 126, .10);
+  border: 1px solid rgba(26, 161, 126, .35); color: #146b55;
+}
+.offline-note.warn { background: rgba(217, 119, 6, .10); border-color: rgba(217, 119, 6, .35); color: #8a4d05; }

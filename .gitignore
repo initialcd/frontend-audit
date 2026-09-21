@@ -9,4 +9,6 @@ reports/
 reports-smoke/
 reports-ui/
 downloads/
+downloads-ui/
 config.yaml
+config.local.yaml

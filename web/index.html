@@ -10,6 +10,7 @@
 <header>
   <h1>前端代码审计 · 敏感信息 & API 递归发现 <span style="font-weight:400;color:var(--muted);font-size:14px">by inicd</span></h1>
   <div class="badges">
+    <span id="badge-mode" class="badge on">模式: 仅下载</span>
     <span id="badge-llm" class="badge off">DeepSeek: 检测中</span>
     <span id="badge-proxy" class="badge off">代理: 关</span>
   </div>
@@ -19,6 +20,26 @@
   <!-- 左：表单 -->
   <div class="panel">
     <div class="panel-body">
+      <div class="form-row">
+        <label>运行模式</label>
+        <div class="mode-picker">
+          <label class="mode-card active" data-mode="download">
+            <input type="radio" name="mode" value="download" checked>
+            <div>
+              <div class="mode-title">仅下载 <span class="tag-offline">离线可用</span></div>
+              <div class="mode-desc">递归抓取前端资源存盘，不审计、不调 LLM、不需要 API Key</div>
+            </div>
+          </label>
+          <label class="mode-card" data-mode="audit">
+            <input type="radio" name="mode" value="audit">
+            <div>
+              <div class="mode-title">审计 <span class="tag-llm">可选 LLM</span></div>
+              <div class="mode-desc">抓取 + 敏感信息审计 + 接口发现；无 Key 时可勾选「纯本地正则」</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
       <div class="form-row">
         <label>授权扫描清单（每行一个 URL）</label>
         <textarea id="seeds" placeholder="https://target.example.com&#10;https://app.example.com/index.html"></textarea>
@@ -50,18 +71,34 @@
         <input type="number" id="qps" value="5" min="0" step="0.5">
       </div>
 
-      <div class="form-row">
+      <!-- 仅下载模式：输出目录 -->
+      <div class="form-row" id="row-outdir" style="display:none">
+        <label>下载输出目录</label>
+        <input type="text" id="out_dir" placeholder="downloads-ui">
+        <div class="hint">相对路径以工具根目录为基准；落盘结构为 &lt;目录&gt;/&lt;主机名&gt;/&lt;URL路径&gt;</div>
+      </div>
+
+      <!-- 审计模式专属 -->
+      <div class="form-row audit-only" style="display:none">
         <div class="check">
           <input type="checkbox" id="llm">
           <label for="llm" style="margin:0">启用 DeepSeek 审计（关闭则纯本地正则）</label>
         </div>
       </div>
-      <div class="form-row">
+      <div class="form-row audit-only" style="display:none">
         <div class="check">
           <input type="checkbox" id="audit_json">
           <label for="audit_json" style="margin:0">JSON 内容也送 LLM 审计（默认关，省 token）</label>
         </div>
       </div>
+
+      <div class="offline-note" id="offline-note" style="display:none">
+        <strong>离线模式</strong>：仅下载不触碰 LLM，无需 API Key，可完全离线运行。
+      </div>
+      <div class="offline-note warn" id="offline-note-audit" style="display:none">
+        <strong>无外网提示</strong>：审计模式默认会调用 DeepSeek。当前未配置 API Key，将自动降级为纯本地正则。
+      </div>
+
       <div class="form-row">
         <div class="check">
           <input type="checkbox" id="proxy">
@@ -73,12 +110,12 @@
         <select id="render_mode">
           <option value="hybrid">hybrid — 仅对 SPA 空壳启用（推荐，平衡速度与覆盖率）</option>
           <option value="full">full — 对所有页面启用（覆盖率最高，速度较慢）</option>
-          <option value="off">off — 关闭渲染，纯 httpx 模式</option>
+          <option value="off">off — 关闭渲染，纯 httpx 模式（离线推荐）</option>
         </select>
       </div>
 
       <div class="btn-row">
-        <button id="start" class="primary" type="button">开始扫描</button>
+        <button id="start" class="primary" type="button">开始下载</button>
         <button id="cancel" class="ghost" type="button" style="display:none">取消</button>
       </div>
     </div>
@@ -88,9 +125,10 @@
   <div class="panel main">
     <div class="tabs">
       <button class="tab active" data-tab="progress">进度</button>
-      <button class="tab" data-tab="findings">发现</button>
-      <button class="tab" data-tab="endpoints">接口</button>
+      <button class="tab audit-only" data-tab="findings">发现</button>
+      <button class="tab audit-only" data-tab="endpoints">接口</button>
       <button class="tab" data-tab="nodes">节点</button>
+      <button class="tab file-only" data-tab="files">文件</button>
     </div>
     <div class="tab-content">
       <!-- 进度 -->
@@ -110,9 +148,10 @@
           <div class="metric"><div class="k">抓取节点</div><div class="v" id="m-nodes">0</div></div>
           <div class="metric"><div class="k">已发现 / 排队</div><div class="v" id="m-discovered" style="font-size:16px">0/0</div></div>
           <div class="metric"><div class="k">HTML / JS / JSON</div><div class="v" id="m-kinds">0/0/0</div></div>
-          <div class="metric"><div class="k">审计发现</div><div class="v" id="m-findings">0</div></div>
-          <div class="metric"><div class="k">接口探测</div><div class="v" id="m-endpoints">0</div></div>
-          <div class="metric"><div class="k">LLM 调用</div><div class="v" id="m-llm">0</div></div>
+          <div class="metric" id="card-downloaded"><div class="k">已落盘</div><div class="v" id="m-downloaded">0</div></div>
+          <div class="metric audit-only" style="display:none"><div class="k">审计发现</div><div class="v" id="m-findings">0</div></div>
+          <div class="metric audit-only" style="display:none"><div class="k">接口探测</div><div class="v" id="m-endpoints">0</div></div>
+          <div class="metric audit-only" style="display:none"><div class="k">LLM 调用</div><div class="v" id="m-llm">0</div></div>
           <div class="metric"><div class="k">并发 / 深度</div><div class="v" id="m-conc" style="font-size:16px">0/0</div></div>
           <div class="metric"><div class="k">跳过(域/重/预算)</div><div class="v" id="m-skip">0/0/0</div></div>
           <div class="metric"><div class="k">状态</div><div class="v" id="m-status" style="font-size:14px">空闲</div></div>
@@ -121,8 +160,8 @@
         <div id="log"></div>
       </div>
 
-      <!-- 发现 -->
-      <div id="tab-findings" class="tab-pane">
+      <!-- 发现（审计） -->
+      <div id="tab-findings" class="tab-pane audit-only">
         <div class="dl-row">
           <button class="ghost" onclick="dl('md')">下载 report.md</button>
           <button class="ghost" onclick="dl('json')">下载 full.json</button>
@@ -133,8 +172,8 @@
         </table>
       </div>
 
-      <!-- 接口 -->
-      <div id="tab-endpoints" class="tab-pane">
+      <!-- 接口（审计） -->
+      <div id="tab-endpoints" class="tab-pane audit-only">
         <table>
           <thead><tr><th>接口</th><th>GET</th><th>OPTIONS</th><th>POST</th><th>CORS</th></tr></thead>
           <tbody id="tb-endpoints"></tbody>
@@ -146,6 +185,19 @@
         <table>
           <thead><tr><th>URL</th><th>状态</th><th>类型</th><th>大小</th><th>深度</th></tr></thead>
           <tbody id="tb-nodes"></tbody>
+        </table>
+      </div>
+
+      <!-- 文件（仅下载） -->
+      <div id="tab-files" class="tab-pane file-only">
+        <div class="dl-row">
+          <span class="hint" id="files-dir"></span>
+          <button class="ghost" onclick="dl('json')">导出清单 JSON</button>
+          <button class="ghost" onclick="dl('txt')">导出清单 TXT</button>
+        </div>
+        <table>
+          <thead><tr><th>相对路径</th><th>大小</th></tr></thead>
+          <tbody id="tb-files"></tbody>
         </table>
       </div>
     </div>

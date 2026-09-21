@@ -3,6 +3,8 @@ let pollTimer = null;
 let startedAt = null;
 let currentStatus = "idle";
 let lastLiveLoad = 0; // 运行中结果表刷新的节流时间戳（2s 一次，避免大表高频重建）
+let llmAvailable = false;
+let currentMode = "download"; // download | audit
 
 // ---------- 初始化 ----------
 async function init() {
@@ -11,6 +13,7 @@ async function init() {
     $("depth").value = cfg.max_depth;
     $("concurrency").value = cfg.concurrency;
     $("qps").value = cfg.per_domain_qps;
+    llmAvailable = !!cfg.llm_available;
     $("llm").checked = cfg.llm_enabled && cfg.llm_available;
     $("audit_json").checked = !!cfg.audit_json;
     $("proxy").checked = cfg.proxy_enabled;
@@ -18,9 +21,9 @@ async function init() {
     $("live-concurrency").value = cfg.concurrency;
     $("live-depth").value = cfg.max_depth;
     const llmBadge = $("badge-llm");
-    llmBadge.textContent = "DeepSeek: " + (cfg.llm_available ? "已配置" : "未配置");
-    llmBadge.className = "badge " + (cfg.llm_available ? "on" : "off");
-    if (!cfg.llm_available) {
+    llmBadge.textContent = "DeepSeek: " + (llmAvailable ? "已配置" : "未配置");
+    llmBadge.className = "badge " + (llmAvailable ? "on" : "off");
+    if (!llmAvailable) {
       $("llm").disabled = true;
       $("llm").title = "未配置 DEEPSEEK_API_KEY，请在 config.yaml 设置";
     }
@@ -28,6 +31,7 @@ async function init() {
     const proxyBadge = $("badge-proxy");
     proxyBadge.textContent = "代理: " + (cfg.proxy_enabled ? "开" : "关");
     proxyBadge.className = "badge " + (cfg.proxy_enabled ? "on" : "off");
+    applyMode("download");
   } catch (e) {
     setStatus("加载配置失败：" + e, true);
   }
@@ -36,6 +40,41 @@ async function init() {
 function syncAuditJson() {
   $("audit_json").disabled = $("llm").disabled || !$("llm").checked;
 }
+
+// ---------- 模式切换：控制哪些控件与选项卡可见 ----------
+function applyMode(mode) {
+  currentMode = mode;
+  const isDownload = mode === "download";
+
+  document.querySelectorAll(".audit-only").forEach((el) => {
+    el.style.display = isDownload ? "none" : "";
+  });
+  document.querySelectorAll(".file-only").forEach((el) => {
+    el.style.display = isDownload ? "" : "none";
+  });
+  $("row-outdir").style.display = isDownload ? "" : "none";
+  $("offline-note").style.display = isDownload ? "" : "none";
+  $("offline-note-audit").style.display = (!isDownload && !llmAvailable) ? "" : "none";
+  $("card-downloaded").style.display = isDownload ? "" : "none";
+
+  $("start").textContent = isDownload ? "开始下载" : "开始扫描";
+  const badge = $("badge-mode");
+  badge.textContent = "模式: " + (isDownload ? "仅下载（离线可用）" : "审计");
+  badge.className = "badge " + (isDownload ? "on" : "");
+
+  document.querySelectorAll(".mode-card").forEach((c) => {
+    c.classList.toggle("active", c.dataset.mode === mode);
+  });
+
+  // 切到隐藏选项卡时回到进度页，避免停留在不存在的内容上
+  const active = document.querySelector(".tab.active");
+  if (active && active.classList.contains("audit-only") && isDownload) switchTab("progress");
+  if (active && active.classList.contains("file-only") && !isDownload) switchTab("progress");
+}
+
+document.querySelectorAll('input[name="mode"]').forEach((r) =>
+  r.addEventListener("change", () => applyMode(r.value))
+);
 
 // ---------- 标签切换 ----------
 document.querySelectorAll(".tab").forEach((t) =>
@@ -81,6 +120,8 @@ $("start").addEventListener("click", async () => {
     audit_json: $("audit_json").checked,
     proxy: $("proxy").checked,
     render_mode: $("render_mode").value,
+    mode: currentMode,
+    out_dir: $("out_dir").value.trim(),
   };
   updateControls("running");
   startedAt = Date.now();
@@ -143,6 +184,7 @@ async function poll() {
     $("m-nodes").textContent = s.total_nodes ?? 0;
     $("m-discovered").textContent = `${s.discovered ?? 0}/${s.pending ?? 0}`;
     $("m-kinds").textContent = `${s.html ?? 0}/${s.js ?? 0}/${s.json ?? 0}`;
+    $("m-downloaded").textContent = s.downloaded ?? 0;
     $("m-findings").textContent = s.findings ?? 0;
     $("m-endpoints").textContent = s.endpoints ?? 0;
     $("m-llm").textContent = `${s.llm_calls ?? 0}${s.llm_failures ? "/" + s.llm_failures : ""}`;
@@ -169,6 +211,7 @@ async function poll() {
     setTabCount("findings", s.findings ?? 0);
     setTabCount("endpoints", s.endpoints ?? 0);
     setTabCount("nodes", s.total_nodes ?? 0);
+    if (s.mode === "download") setTabCount("files", s.downloaded ?? 0);
 
     // 动态结果：运行中（含暂停/取消中）每 2s 渐进刷新结果表，
     // 完成后强制再全量刷新一次，杜绝"只有任务结束才有内容"。
@@ -219,9 +262,30 @@ async function loadResults() {
     renderFindings(f.findings || []);
     renderEndpoints(e.endpoints || []);
     renderNodes(n.urls || []);
+    if (currentMode === "download") {
+      const fl = await fetchJSON("/api/scan/files");
+      $("files-dir").textContent = fl.dir ? "输出目录：" + fl.dir : "";
+      renderFiles(fl.files || []);
+    }
   } catch (e) {
     console.error(e);
   }
+}
+
+function renderFiles(rows) {
+  const tb = $("tb-files");
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="2" class="empty">暂无文件</td></tr>'; return; }
+  const sorted = rows.slice().sort((a, b) => b.size - a.size);
+  tb.innerHTML = sorted.map((r) =>
+    `<tr><td>${esc(r.path)}</td><td>${fmtSize(r.size)}</td></tr>`
+  ).join("");
+}
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
 }
 
 function renderFindings(rows) {
@@ -309,7 +373,7 @@ function setStatus(text, isError) {
 function switchTab(name) {
   document.querySelector(`.tab[data-tab="${name}"]`).click();
 }
-const TAB_LABELS = { progress: "进度", findings: "发现", endpoints: "接口", nodes: "节点" };
+const TAB_LABELS = { progress: "进度", findings: "发现", endpoints: "接口", nodes: "节点", files: "文件" };
 function setTabCount(name, n) {
   const t = document.querySelector(`.tab[data-tab="${name}"]`);
   if (!t) return;

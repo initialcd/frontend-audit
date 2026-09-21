@@ -59,13 +59,16 @@ class ScanState:
         self.scan_id = ""
         self.status = "idle"  # idle|running|paused|cancelling|done|error|cancelled
         self.params: dict = {}
+        self.mode = "audit"   # audit | download
         self.started_monotonic = 0.0
         self.summary: dict = {}
         self.logs: deque = deque(maxlen=400)
         self.findings: list = []
         self.endpoints: list = []
         self.urls: list = []
+        self.files: list = []          # 下载模式：已落盘文件清单
         self.report_dir: str = ""
+        self.download_dir: str = ""    # 下载模式：输出目录绝对路径
         self.error: str = ""
         self.orch: Orchestrator | None = None
 
@@ -89,6 +92,8 @@ class ScanState:
             s["max_depth"] = int(self.params.get("depth", 0) or 0)
         s.setdefault("discovered", 0)
         s.setdefault("pending", 0)
+        s.setdefault("downloaded", 0)
+        s.setdefault("download_failed", 0)
         done = int(s.get("total_nodes", 0) or 0)
         queued = int(s.get("pending", 0) or 0)
         known = done + queued
@@ -100,6 +105,8 @@ class ScanState:
             s["progress"] = 0.0
         s["status"] = self.status
         s["scan_id"] = self.scan_id
+        s["mode"] = self.mode
+        s["download_dir"] = self.download_dir
         s["elapsed"] = int(time.monotonic() - self.started_monotonic) if self.started_monotonic else 0
         s["logs"] = list(self.logs)
         return s
@@ -122,6 +129,7 @@ class ScanManager:
         state = ScanState()
         state.scan_id = time.strftime("%Y%m%d-%H%M%S")
         state.params = params
+        state.mode = "download" if params.get("mode") == "download" else "audit"
         state.status = "running"
         state.started_monotonic = time.monotonic()
         self.state = state
@@ -204,11 +212,15 @@ class ScanManager:
     async def _async(self, state: ScanState, params: dict) -> None:
         # 基于全局配置深拷贝后用 UI 参数覆盖
         cfg = self.base_cfg.model_copy(deep=True)
+        download_only = state.mode == "download"
         cfg.scan.max_depth = int(params.get("depth", cfg.scan.max_depth))
         cfg.scan.concurrency = int(params.get("concurrency", cfg.scan.concurrency))
         cfg.scan.per_domain_qps = float(params.get("qps", cfg.scan.per_domain_qps))
-        cfg.scan.llm_enabled = bool(params.get("llm", True)) and bool(cfg.resolve_api_key())
-        cfg.scan.audit_json = bool(params.get("audit_json", False))
+        # 下载模式强制关 LLM：不审计 → 不需要 API Key → 可完全离线
+        cfg.scan.llm_enabled = (
+            bool(params.get("llm", True)) and bool(cfg.resolve_api_key())
+        ) if not download_only else False
+        cfg.scan.audit_json = bool(params.get("audit_json", False)) and not download_only
         cfg.proxy.enabled = bool(params.get("proxy", False))
         cfg.scan.render_mode = str(params.get("render_mode", cfg.scan.render_mode))
         cfg.scope.domains = list(params.get("domains", []))
@@ -220,6 +232,15 @@ class ScanManager:
                 pass
         cfg.storage.db_path = "state-ui.db"
         cfg.storage.output_dir = "reports-ui"
+
+        # 下载模式输出目录：沿用 _url_to_filepath 结构（<dir>/<host>/<path>）
+        if download_only:
+            out = str(params.get("out_dir", "") or "").strip() or "downloads-ui"
+            dl_dir = Path(out)
+            if not dl_dir.is_absolute():
+                dl_dir = (ROOT / dl_dir).resolve()
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            state.download_dir = str(dl_dir)
 
         handler = MemoryHandler(state.logs)
         root = logging.getLogger()
@@ -233,11 +254,20 @@ class ScanManager:
         dedup = Dedup()
         store = Store(cfg.storage.db_path)
         orch = Orchestrator(cfg, store, fetcher, auditor, dedup)
+        if download_only:
+            orch.download_only = True
+            orch.download_dir = Path(state.download_dir)
         state.orch = orch
-        state.logs.append(f"[*] 开始扫描：种子 {len(params.get('seeds', []))} 个，"
-                          f"白名单 {cfg.scope.domains}，深度 {cfg.scan.max_depth}，"
-                          f"LLM {'开' if cfg.scan.llm_enabled else '关'}，"
-                          f"代理 {'开' if cfg.proxy.enabled else '关'}")
+        if download_only:
+            state.logs.append(f"[*] 开始下载：种子 {len(params.get('seeds', []))} 个，"
+                              f"白名单 {cfg.scope.domains}，深度 {cfg.scan.max_depth}，"
+                              f"并发 {cfg.scan.concurrency}，输出 {state.download_dir}")
+            state.logs.append("[*] 下载模式：不调 LLM、不需要 API Key、不产生审计结果，可完全离线运行")
+        else:
+            state.logs.append(f"[*] 开始扫描：种子 {len(params.get('seeds', []))} 个，"
+                              f"白名单 {cfg.scope.domains}，深度 {cfg.scan.max_depth}，"
+                              f"LLM {'开' if cfg.scan.llm_enabled else '关'}，"
+                              f"代理 {'开' if cfg.proxy.enabled else '关'}")
         try:
             # 边跑边物化结果：运行中即把 SQLite 里的最新发现/接口/节点同步到
             # state，供前端「发现/接口/节点」选项卡实时展示（不再等任务完成）。
@@ -251,18 +281,74 @@ class ScanManager:
             state.summary = dataclasses.asdict(summary)
             # 最终全量刷新一次，保证 done 后数据完整
             await self._materialize(state, store)
-            out = await write_reports(cfg, store, summary)
-            state.report_dir = str(out)
+            if download_only:
+                # 下载模式无审计报告，改为按落盘文件清单生成一份索引
+                state.files = self._collect_files(state.download_dir)
+                state.report_dir = await self._write_download_manifest(state)
+            else:
+                out = await write_reports(cfg, store, summary)
+                state.report_dir = str(out)
             state.status = "cancelled" if orch._cancel else "done"
-            state.logs.append(f"[*] 扫描{state.status}：{state.summary.get('findings',0)} 条发现，"
-                              f"{state.summary.get('endpoints',0)} 个接口")
+            if download_only:
+                state.logs.append(f"[*] 下载{state.status}：成功 {summary.downloaded}，"
+                                  f"失败 {summary.download_failed}，目录 {state.download_dir}")
+            else:
+                state.logs.append(f"[*] 扫描{state.status}：{state.summary.get('findings',0)} 条发现，"
+                                  f"{state.summary.get('endpoints',0)} 个接口")
         except asyncio.CancelledError:
             state.status = "cancelled"
+            if download_only and state.download_dir:
+                state.files = self._collect_files(state.download_dir)
         finally:
             await fetcher.close()
             await orch.renderer.close()
             store.close()
             logging.getLogger().removeHandler(handler)
+
+    @staticmethod
+    def _collect_files(root: str) -> list[dict]:
+        """枚举下载目录下的文件，供前端「文件」选项卡展示与清单导出。"""
+        if not root:
+            return []
+        base = Path(root)
+        if not base.exists():
+            return []
+        rows: list[dict] = []
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            try:
+                rel = p.relative_to(base).as_posix()
+                st = p.stat()
+            except OSError:
+                continue
+            rows.append({"path": rel, "size": st.st_size, "mtime": int(st.st_mtime)})
+        return rows
+
+    async def _write_download_manifest(self, state: ScanState) -> str:
+        """下载模式产物清单：落盘到输出目录下的 _manifest.json，便于核对完整性。"""
+        if not state.download_dir:
+            return ""
+        d = Path(state.download_dir)
+        total = sum(r["size"] for r in state.files)
+        manifest = {
+            "mode": "download",
+            "scan_id": state.scan_id,
+            "output_dir": str(d),
+            "file_count": len(state.files),
+            "total_bytes": total,
+            "seeds": state.params.get("seeds", []),
+            "domains": state.params.get("domains", []),
+            "max_depth": state.params.get("depth"),
+            "files": state.files,
+        }
+        try:
+            (d / "_manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            return ""
+        return str(d)
 
     async def _materialize(self, state: ScanState, store: Store) -> None:
         """把数据库里的最新结果增量同步到 state（HTTP 线程可读）。"""
@@ -342,6 +428,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"endpoints": MGR.state.endpoints})
         if path == "/api/scan/urls":
             return self._json({"urls": MGR.state.urls})
+        if path == "/api/scan/files":
+            # 下载模式：实时枚举落盘文件（运行中也能看进度）
+            rows = MGR.state.files
+            if MGR.state.mode == "download" and MGR.state.download_dir:
+                if MGR.state.status in ("running", "paused", "cancelling"):
+                    rows = ScanManager._collect_files(MGR.state.download_dir)
+            return self._json({"files": rows, "dir": MGR.state.download_dir})
         if path == "/api/scan/report":
             fmt = parse_qs(u.query).get("format", ["md"])[0]
             return self._serve_report(fmt)
@@ -375,16 +468,38 @@ class Handler(BaseHTTPRequestHandler):
                  if s.strip() and not s.strip().startswith("#")]
         seeds = [s for s in seeds if s.startswith(("http://", "https://"))]
         domains = parse_domains(str(params.get("domains", "")))
+        mode = "download" if str(params.get("mode", "audit")) == "download" else "audit"
         if not seeds:
             return self._json({"error": "授权扫描清单为空或无合法 http(s) URL"}, 400)
         if not domains:
             return self._json({"error": "授权域名白名单为空（安全约束，拒绝运行）"}, 400)
         params["seeds"] = seeds
         params["domains"] = domains
+        params["mode"] = mode
         res = MGR.start(params)
         self._json(res, 200 if "error" not in res else 409)
 
     def _serve_report(self, fmt: str) -> None:
+        # 下载模式没有审计报告，导出落盘清单（_manifest.json）
+        if MGR.state.mode == "download":
+            if not MGR.state.download_dir:
+                return self._json({"error": "尚无下载任务"}, 404)
+            d = Path(MGR.state.download_dir)
+            files = MGR.state.files or ScanManager._collect_files(str(d))
+            total = sum(r["size"] for r in files)
+            manifest = {
+                "mode": "download", "scan_id": MGR.state.scan_id,
+                "output_dir": str(d), "file_count": len(files), "total_bytes": total,
+                "files": files,
+            }
+            if fmt == "txt":
+                body = "\n".join(f'{r["size"]}\t{r["path"]}' for r in files)
+                return self._send(body.encode("utf-8"), "text/plain; charset=utf-8",
+                                  attachment="manifest.txt")
+            return self._send(
+                json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+                MIME[".json"], attachment="_manifest.json",
+            )
         if not MGR.state.report_dir:
             return self._json({"error": "尚无报告，请先完成一次扫描"}, 404)
         d = Path(MGR.state.report_dir)
@@ -405,6 +520,9 @@ class Handler(BaseHTTPRequestHandler):
             "audit_json": cfg.scan.audit_json,
             "proxy_enabled": cfg.proxy.enabled,
             "render_mode": cfg.scan.render_mode,
+            # 离线可用性：下载模式永远可离线；审计模式在无 Key 时自动降级为纯本地正则
+            "network_required": False,
+            "offline_ready": True,
         }
 
 
@@ -436,8 +554,12 @@ def main() -> None:
             print(f"[!] 绑定失败：{e}")
         sys.exit(1)
     url = f"http://{args.host}:{args.port}"
-    print(f"[*] 前端审计 Web UI 已启动：{url}")
-    print(f"[*] DeepSeek: {'已配置' if base_cfg.resolve_api_key() else '未配置（UI 将走纯本地正则模式）'}")
+    print(f"[*] 前端审计/下载 Web UI 已启动：{url}")
+    if base_cfg.resolve_api_key():
+        print("[*] DeepSeek: 已配置（审计模式可开 LLM；下载模式不调 LLM）")
+    else:
+        print("[*] DeepSeek: 未配置 → 审计模式自动走纯本地正则，下载模式不受影响")
+    print("[*] 离线提示：选「仅下载」模式时不需要 API Key，也不访问任何外部 LLM")
     print("[*] 按 Ctrl+C 停止")
     try:
         httpd.serve_forever()

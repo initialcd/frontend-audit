@@ -1,20 +1,21 @@
 # 前端代码审计 + 下载工具
 
-递归下载目标网站的前端资源（HTML / JS / JSON / sourcemap），本地正则扫描敏感信息与接口路径，可选调用 DeepSeek 做二次语义审计。提供 CLI 和 Web UI 两种入口，另附纯下载模式。
+递归下载目标网站的前端资源（HTML / JS / JSON / sourcemap），本地正则扫描敏感信息与接口路径，可选调用 DeepSeek 做二次语义审计。提供 CLI 和 Web UI 两种入口，两种入口都内置**纯下载模式**（不审计、不调 LLM、无需 API Key，可完全离线运行）。
 
 ## 功能
 
+- **双模式**：仅下载（离线可用，零外网依赖）与审计（可选 LLM）共用同一套递归引擎。
 - 递归爬取：从种子 URL 出发，提取 HTML 中的 `<script>`、JS 中的 chunk/sourcemap，持续扩展下载范围，不做目录爆破。
 - 本地正则扫描：密钥、Token、版本号、API 路径，零 token 成本。
 - **CMS 敏感路径检测**：基于路径规则库（composer.json / installed.json / settings.php / .env / .git/HEAD / vendor/bin、主题与模块源码、备份文件、phpMyAdmin 等）自动标记依赖与配置泄露，零 token 成本。
 - **源码暴露检测**：响应体含 PHP/Python 源码特征但 Content-Type 非源码类型时判定源码泄露（针对 nginx 未配置解析、`.inc`/`.module` 等返回源码的场景）。
 - **JSON 配置块分析**：`drupal-settings-json` 等内联 JSON 中的 `permissionsHash` / `csrfToken` 等安全字段哈希泄露检测。
-- LLM 二次审计：把正则命中的可疑片段交给 DeepSeek 确认，默认只对 JS 开启，JSON 可按需开启；提示词内置源码暴露与 CMS 配置泄露识别。
+- LLM 二次审计：把正则命中的可疑片段交给 DeepSeek 确认，默认只对 JS 开启，JSON 可按需开启；提示词内置源码暴露与 CMS 配置泄露识别。**未配置 Key 时自动降级为纯本地正则，不报错、不中断**。
 - 接口探测：对发现的 API 路径发 OPTIONS / POST，判断可用方法与 CORS。
 - 增强渲染：Playwright + CDP + JS Hook，捕获 SPA 动态加载的代码。
 - 域名白名单约束：未配置白名单拒绝运行，递归不越界。
 - 多主域名并存：白名单支持多个主域名，资产按"最长匹配主域名"自动分组，各组独立配额互不挤占。
-- Web UI 实时结果：扫描运行中「发现/接口/节点」选项卡动态刷新，无需等任务完成。
+- Web UI 实时结果：扫描/下载运行中「发现/接口/节点/文件」选项卡动态刷新，无需等任务完成。
 
 ## 安装
 
@@ -108,7 +109,9 @@ python main.py -u urls.txt --domains example.com --audit-json
 
 ### 下载模式
 
-只递归下载前端资源到本地，不审计、不调 LLM、不探测接口。递归引擎与审计模式一致。
+只递归下载前端资源到本地，**不审计、不调 LLM、不探测接口**。递归引擎与审计模式一致。
+
+**下载模式不需要 API Key，可完全离线运行**（不访问任何外部 LLM 服务）。
 
 ```bash
 python main.py --download -u https://target.example.com/ --domains target.example.com -o ./dump
@@ -117,7 +120,7 @@ python main.py --download -u https://target.example.com/ --domains target.exampl
 python main.py --download -u targets.txt --domains example.com -o ./dump -d 3
 ```
 
-下载目录结构按 `输出目录/域名/URL路径` 保存。
+下载目录结构按 `输出目录/域名/URL路径` 保存，无后缀文件按 Content-Type 补 `.js` / `.json` / `.html` / `.css`。
 
 ### 参数表
 
@@ -138,11 +141,26 @@ python main.py --download -u targets.txt --domains example.com -o ./dump -d 3
 ```bash
 python webui.py            # 默认 http://127.0.0.1:8000
 python webui.py -p 9000
+python webui.py -c config.local.yaml   # 指定配置
 ```
 
-在页面填写授权扫描清单（每行一个 URL）和域名白名单，调整深度、并发、QPS，勾选是否启用 LLM、是否对 JSON 送 LLM、是否启用代理，然后点击开始。运行中可实时改并发/深度并应用，无需重跑。完成后可下载 `report.md` 和 `full.json`。
+页面左上角先选**运行模式**，两种模式共用同一套递归引擎：
 
-`audit_json` 开关仅在勾选「启用 DeepSeek 审计」时可用；未配置 API Key 时自动禁用。
+**仅下载（默认，离线可用）** — 递归抓取前端资源存盘，不审计、不调 LLM、不需要 API Key。界面只显示「进度 / 节点 / 文件」三个选项卡，可单独指定输出目录。适用于不通外网的环境。
+
+**审计** — 抓取 + 敏感信息审计 + 接口发现。显示「发现 / 接口 / 节点」选项卡，完成后可下载 `report.md` 与 `full.json`。未配置 API Key 时页面会提示将自动降级为纯本地正则（等价 CLI 的 `--no-llm`）。
+
+两种模式均支持运行中改并发/深度并即时应用、暂停/继续、取消。下载模式完成后走「文件」选项卡查看落盘清单，并可导出清单 JSON/TXT（同时在输出目录写入 `_manifest.json`）。
+
+### 离线环境说明
+
+不通外网时推荐做法：
+
+1. 模式选**仅下载** —— 全程不触碰 LLM，无需任何 Key。
+2. 增强渲染选 `off` —— 避免因缺 Playwright 浏览器而空耗时间。
+3. 若确实需要审计能力，选**审计**模式并**不勾选** LLM（纯本地正则，零外网依赖）。
+
+> 注意：Web UI 每次扫描使用独立的 `state-ui.db` 并在启动时清理，因此**不做跨次断点续跑**；CLI 的 `state.db` 则持久保留。同一个 URL 在 CLI 下重复执行会因去重而显示"成功 0"，属预期行为——想全量重跑请删除 `state.db`。
 
 ## 递归 vs 目录爆破
 

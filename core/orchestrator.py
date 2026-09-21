@@ -12,6 +12,8 @@ import asyncio
 import logging
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from core.auditor import Auditor
 from core.config import Config
@@ -66,6 +68,8 @@ class Summary:
     skipped_scope: int = 0
     skipped_dup: int = 0
     skipped_budget: int = 0
+    downloaded: int = 0          # 纯下载模式：成功落盘的文件数
+    download_failed: int = 0     # 纯下载模式：下载失败的节点数
 
 
 class Orchestrator:
@@ -92,6 +96,11 @@ class Orchestrator:
         self._worker_seq = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._finished = False
+        # 纯下载模式：只递归抓取 + 落盘，跳过一切审计（本地正则、CMS/源码检测、
+        # LLM、接口探测），因此不需要 API Key，可完全离线运行。
+        self.download_only = False
+        self.download_dir: Path | None = None
+        self._dl_lock = asyncio.Lock()
 
     # ---------- 暂停 / 恢复 / 动态调参（线程安全，均派发到事件循环） ----------
     def cancel(self) -> bool:
@@ -188,6 +197,76 @@ class Orchestrator:
             wid = self._worker_seq
             self._worker_seq += 1
             self._workers.append(asyncio.create_task(self._worker(wid)))
+
+    # ---------- 纯下载落盘 ----------
+    @staticmethod
+    def _url_to_filepath(url: str, output_dir: Path, content_type: str) -> Path:
+        """URL → 本地路径：保留目录结构，无后缀按 Content-Type 补后缀。
+
+        含路径穿越防护：解码后的 .. 经 resolve() 展开后必须仍在输出目录内。
+        """
+        parsed = urlparse(url)
+        host = (parsed.hostname or "unknown").lower()
+        path = unquote(parsed.path).lstrip("/") or "index.html"
+        if path.endswith("/"):
+            path += "index.html"
+        fp = output_dir / host / path
+        if not fp.suffix:
+            if "javascript" in content_type or "ecmascript" in content_type:
+                fp = fp.with_suffix(".js")
+            elif "json" in content_type:
+                fp = fp.with_suffix(".json")
+            elif "css" in content_type:
+                fp = fp.with_suffix(".css")
+            else:
+                fp = fp.with_suffix(".html")
+        base = output_dir.resolve()
+        if not fp.resolve().is_relative_to(base):
+            raise ValueError(f"拒绝写出输出目录之外：{url} -> {fp}")
+        return fp
+
+    async def _save_to_disk(self, fr, kind: str) -> None:
+        """纯下载模式落盘。内容哈希去重：不同 query 的相同内容只写一次。"""
+        ch = content_hash(fr.body)
+        if self.dedup.seen_content(ch):
+            self.summary.skipped_dup += 1
+            return
+        self.dedup.mark_content(ch)
+        try:
+            filepath = self._url_to_filepath(fr.final_url, self.download_dir, fr.content_type)
+        except ValueError as exc:
+            logger.warning("跳过非法路径 %s：%s", fr.url, exc)
+            self.summary.skipped_scope += 1
+            return
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_bytes(fr.body)
+        async with self._dl_lock:
+            self.summary.downloaded += 1
+            n = self.summary.downloaded
+        logger.info("[%d] %s → %s (%d B)", n, fr.url, filepath.name, fr.size)
+
+    async def _recurse(self, fr, kind: str, depth: int) -> None:
+        """从已抓取内容中提取子链接入队（下载模式与审计模式共用）。"""
+        if depth >= self.cfg.scan.max_depth:
+            return
+        if kind == "html":
+            html = decode(fr.body)
+            external, _ = extract_scripts(html)
+            for src in external:
+                target = resolve_url(fr.final_url, src)
+                if target:
+                    await self._enqueue(target, depth + 1, f"html:{fr.url}")
+        elif kind == "js":
+            text = decode(fr.body)
+            pf = prefilter_js(text, self.cfg.scan.snippet_context, self.cfg.scan.llm_snippet_cap)
+            for c in pf.chunk_urls:
+                target = resolve_url(fr.final_url, c)
+                if target:
+                    await self._enqueue(target, depth + 1, f"js:{fr.url}")
+            if pf.source_map:
+                target = resolve_url(fr.final_url, pf.source_map)
+                if target:
+                    await self._enqueue(target, depth + 1, f"map:{fr.url}")
 
     # ---------- 入口 ----------
     async def run(self, seeds: list[str]) -> Summary:
@@ -297,6 +376,12 @@ class Orchestrator:
         if fr.status == 0 or fr.body is None:
             return
         self.summary.fetched += 1
+
+        # ===== 纯下载模式：只落盘 + 递归，跳过全部审计环节 =====
+        if self.download_only:
+            await self._save_to_disk(fr, kind)
+            await self._recurse(fr, kind, depth)
+            return
 
         # ===== 新增：CMS 敏感路径分析（零 token 成本）=====
         cms_findings = analyze_url_for_cms_findings(url)
