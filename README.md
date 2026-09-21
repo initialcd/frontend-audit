@@ -1,21 +1,21 @@
 # 前端代码审计 + 下载工具
 
-递归下载目标网站的前端资源（HTML / JS / JSON / sourcemap），本地正则扫描敏感信息与接口路径，可选调用 DeepSeek 做二次语义审计。提供 CLI 和 Web UI 两种入口，两种入口都内置**纯下载模式**（不审计、不调 LLM、无需 API Key，可完全离线运行）。
+递归下载目标网站的前端资源（HTML / JS / JSON / sourcemap），本地正则扫描敏感信息与接口路径，可选调用 DeepSeek 做二次语义审计。提供 CLI 和 Web UI 两种入口，两者都内置纯下载模式：不审计、不调 LLM、不需要 API Key，可完全离线运行。
 
 ## 功能
 
-- **双模式**：仅下载（离线可用，零外网依赖）与审计（可选 LLM）共用同一套递归引擎。
-- 递归爬取：从种子 URL 出发，提取 HTML 中的 `<script>`、JS 中的 chunk/sourcemap，持续扩展下载范围，不做目录爆破。
-- 本地正则扫描：密钥、Token、版本号、API 路径，零 token 成本。
-- **CMS 敏感路径检测**：基于路径规则库（composer.json / installed.json / settings.php / .env / .git/HEAD / vendor/bin、主题与模块源码、备份文件、phpMyAdmin 等）自动标记依赖与配置泄露，零 token 成本。
-- **源码暴露检测**：响应体含 PHP/Python 源码特征但 Content-Type 非源码类型时判定源码泄露（针对 nginx 未配置解析、`.inc`/`.module` 等返回源码的场景）。
-- **JSON 配置块分析**：`drupal-settings-json` 等内联 JSON 中的 `permissionsHash` / `csrfToken` 等安全字段哈希泄露检测。
-- LLM 二次审计：把正则命中的可疑片段交给 DeepSeek 确认，默认只对 JS 开启，JSON 可按需开启；提示词内置源码暴露与 CMS 配置泄露识别。**未配置 Key 时自动降级为纯本地正则，不报错、不中断**。
+- 双模式：仅下载（离线可用）与审计（可选 LLM），共用同一套递归引擎。
+- 递归爬取：从种子 URL 出发，提取 HTML 中的 `<script>`、JS 中的 chunk 与 sourcemap，持续扩展范围，不做目录爆破。
+- 本地正则扫描：密钥、Token、版本号、API 路径，不消耗 token。
+- CMS 敏感路径检测：按路径规则库标记依赖与配置泄露，详见下文。
+- 源码暴露检测：响应体含源码特征但 Content-Type 不对时判定泄露。
+- JSON 配置块分析：内联 JSON 中的安全字段哈希泄露检测。
+- LLM 二次审计：把正则命中的可疑片段交给 DeepSeek 确认，默认只对 JS 开启，JSON 可按需开启。未配置 Key 时自动降级为纯本地正则，不报错、不中断。
 - 接口探测：对发现的 API 路径发 OPTIONS / POST，判断可用方法与 CORS。
 - 增强渲染：Playwright + CDP + JS Hook，捕获 SPA 动态加载的代码。
 - 域名白名单约束：未配置白名单拒绝运行，递归不越界。
-- 多主域名并存：白名单支持多个主域名，资产按"最长匹配主域名"自动分组，各组独立配额互不挤占。
-- Web UI 实时结果：扫描/下载运行中「发现/接口/节点/文件」选项卡动态刷新，无需等任务完成。
+- 多主域名并存：白名单支持多个主域名，资产按最长匹配分组，各组独立配额。
+- Web UI 实时结果：运行中「发现 / 接口 / 节点 / 文件」选项卡动态刷新，无需等任务完成。
 
 ## 安装
 
@@ -109,9 +109,9 @@ python main.py -u urls.txt --domains example.com --audit-json
 
 ### 下载模式
 
-只递归下载前端资源到本地，**不审计、不调 LLM、不探测接口**。递归引擎与审计模式一致。
+只递归下载前端资源到本地，不审计、不调 LLM、不探测接口。递归引擎与审计模式一致。
 
-**下载模式不需要 API Key，可完全离线运行**（不访问任何外部 LLM 服务）。
+不需要 API Key，可完全离线运行。
 
 ```bash
 python main.py --download -u https://target.example.com/ --domains target.example.com -o ./dump
@@ -120,7 +120,7 @@ python main.py --download -u https://target.example.com/ --domains target.exampl
 python main.py --download -u targets.txt --domains example.com -o ./dump -d 3
 ```
 
-下载目录结构按 `输出目录/域名/URL路径` 保存，无后缀文件按 Content-Type 补 `.js` / `.json` / `.html` / `.css`。
+目录结构按 `输出目录/域名/URL路径` 保存，无后缀文件按 Content-Type 补 `.js` / `.json` / `.html` / `.css`。
 
 ### 参数表
 
@@ -144,67 +144,57 @@ python webui.py -p 9000
 python webui.py -c config.local.yaml   # 指定配置
 ```
 
-页面左上角先选**运行模式**，两种模式共用同一套递归引擎：
+页面左上角先选运行模式，两种模式共用同一套递归引擎。
 
-**仅下载（默认，离线可用）** — 递归抓取前端资源存盘，不审计、不调 LLM、不需要 API Key。界面只显示「进度 / 节点 / 文件」三个选项卡，可单独指定输出目录。适用于不通外网的环境。
+仅下载是默认项，离线可用。它只做递归抓取存盘，不审计、不调 LLM、不需要 API Key，界面显示「进度 / 节点 / 文件」三个选项卡，可指定输出目录。
 
-**审计** — 抓取 + 敏感信息审计 + 接口发现。显示「发现 / 接口 / 节点」选项卡，完成后可下载 `report.md` 与 `full.json`。未配置 API Key 时页面会提示将自动降级为纯本地正则（等价 CLI 的 `--no-llm`）。
+审计模式在抓取基础上做敏感信息审计和接口发现，显示「发现 / 接口 / 节点」选项卡，完成后可下载 `report.md` 与 `full.json`。未配置 API Key 时页面会提示将自动降级为纯本地正则，效果等同 CLI 的 `--no-llm`。
 
-两种模式均支持运行中改并发/深度并即时应用、暂停/继续、取消。下载模式完成后走「文件」选项卡查看落盘清单，并可导出清单 JSON/TXT（同时在输出目录写入 `_manifest.json`）。
+两种模式都支持运行中改并发和深度并即时应用、暂停继续、取消。下载完成后在「文件」选项卡查看落盘清单，可导出 JSON 或 TXT，同时在输出目录写入 `_manifest.json`。
 
-### 离线环境说明
+### 离线环境
 
-不通外网时推荐做法：
+不通外网时按下面配置：
 
-1. 模式选**仅下载** —— 全程不触碰 LLM，无需任何 Key。
-2. 增强渲染选 `off` —— 避免因缺 Playwright 浏览器而空耗时间。
-3. 若确实需要审计能力，选**审计**模式并**不勾选** LLM（纯本地正则，零外网依赖）。
+1. 模式选仅下载，全程不触碰 LLM，不需要任何 Key。
+2. 增强渲染选 `off`，否则会因缺少 Playwright 浏览器而空等。
+3. 确实需要审计能力时，选审计模式但不勾选 LLM，纯本地正则，零外网依赖。
 
-> 注意：Web UI 每次扫描使用独立的 `state-ui.db` 并在启动时清理，因此**不做跨次断点续跑**；CLI 的 `state.db` 则持久保留。同一个 URL 在 CLI 下重复执行会因去重而显示"成功 0"，属预期行为——想全量重跑请删除 `state.db`。
+Web UI 每次任务使用独立的 `state-ui.db` 并在启动时清理，不做跨次断点续跑；CLI 的 `state.db` 则持久保留。同一个 URL 在 CLI 下重复执行会因去重而显示"成功 0"，属预期行为，想全量重跑请删除 `state.db`。
 
 ## 递归 vs 目录爆破
 
-工具采用递归爬取：只下载页面代码里实际引用的资源。它能覆盖带 hash 的动态文件名（如 `chunk-2d0a3b4c.js`）；目录爆破靠字典猜路径，无法命中这类文件名，且产生大量 404 噪声。
+工具采用递归爬取，只下载页面代码里实际引用的资源，能覆盖带 hash 的动态文件名（如 `chunk-2d0a3b4c.js`）。目录爆破靠字典猜路径，命中不了这类文件名，还会产生大量 404 噪声。
 
-## 存活探测方式（要不要内置 httpx？）
+## 存活判断
 
-**httpx 不是外置二进制，而是本工具已经依赖的 Python HTTP 库**（`requirements.txt` 第一行，
-`core/fetcher.py` 用它发起全部请求），不需要额外"内置"。
+工具没有独立的存活探测阶段，每次抓取本身就是预检，实现在 `core/fetcher.py`：
 
-本工具没有独立的"存活探测阶段"：**每次抓取本身就是预检**，见 `core/fetcher.py`：
+1. 并发 GET，只取响应头；
+2. `2xx/3xx` 视为存活；`4xx/5xx` 只记状态码，不读响应体；
+3. Content-Type 不在白名单（图片、视频、下载文件等）不下载；
+4. 响应体超过 `max_body_kb` 直接丢弃，防止大文件撑爆内存；
+5. 失败按 `retries` 次指数退避重试，死主机约一次超时即被跳过；
+6. 每域 QPS 限速，间隔带 `qps_jitter` 抖动，避免固定节奏。
 
-1. 并发 GET 请求，先看响应头；
-2. 只把 `2xx/3xx` 当作存活；`4xx/5xx` 记状态但不读 body（死链零成本跳过）；
-3. Content-Type 不在白名单（图片/视频/下载文件等）不下载 body；
-4. 响应体超过 `max_body_kb` 丢弃保护内存；
-5. 失败自动重试（`retries` 次，指数退避），死主机消耗约 1 次超时即被跳过；
-6. 每域 QPS 限速（`per_domain_qps`），限速间隔带 `qps_jitter` 抖动打散节奏。
+这么做的代价是拿不到一份独立的"存活 URL 清单"。需要那种效果，可以在下载模式跑一遍收集全量节点，再针对结果做审计。
 
-这套"预检即探测"的优点是省去一轮独立的 HEAD/存活扫描（少一半请求、更快）；缺点是不会像
-httpx 那样一次性把一批存活 URL 列出来。若你需要"先列存活清单再审计"两阶段模式，可以在
-`--download` 模式跑一遍拿全量节点，或在此基础上加一个 `HEAD` 预检阶段（当前实现刻意不做，
-因为对大部分站点 HEAD 并不比 GET 头快，反而多一轮往返）。
+## 请求特征与触发防护的风险
 
-## 会被防火墙 / WAF 拦截吗？
+工具只做静态抓取、本地正则和可选的 LLM 审计，不发送攻击载荷，因此不会因为载荷本身被拦。但请求频率和指纹仍可能触发防护：
 
-工具本身只做**静态抓取 + 本地正则 + 可选 LLM 审计**，不发送攻击载荷，因此不会因为"攻击行为"
-被拦截；但**请求频率与指纹**仍可能触发防护：
+- 全局并发默认 20、每域 QPS 默认 5/s，多数站点无压力。并发提到 100-500 并抬高 QPS 后，部署了 WAF 的站点很容易封 IP 或弹验证码。
+- 接口探测（`core/method_prober.py` 的 OPTIONS/POST）在 WAF 看来属于主动探测，建议保留 `max_method_probes` 上限，必要时只留 OPTIONS。
+- 降低触发概率：每域 QPS 压到 1-3/s、保留 `qps_jitter` 抖动、走代理池、使用浏览器 UA（默认已带）、避免对同一站点长时间高频递归。
+- 摸不清目标防护强度时，先用小并发试跑一轮，看有无验证码或 429，再决定是否加码。
 
-- **高并发是最大诱因**：全局并发默认 20、每域 QPS 默认 5/s，大多数站点安全；把并发拉到
-  100–500 且提高 QPS 时，教育/政务等部署了 WAF 的站点很容易封 IP 或弹验证码。
-- **接口探测更像"扫描"**：OPTIONS/POST 探测（`core/method_prober.py`）在 WAF 眼里属于主动探测
-  行为，建议保持 `max_method_probes` 上限，必要时只保留 OPTIONS。
-- **降低被识别概率的手段**：每域 QPS 调低（1–3/s）、保留 `qps_jitter` 抖动、走代理池
-  （`proxy.enabled`）、使用真实浏览器 UA（默认已带）、避免对同一站点长时间高频递归。
-- 目标站点防护强度未知时，先小并发试跑一轮看是否有验证码/429，再决定是否加码。
+## 检测规则
 
-## 新增检测能力（CMS 靶标实战沉淀）
+零 token 成本的本地检测全部在 `core/prefilter.py`。
 
-针对 Drupal / WordPress / Joomla 等 CMS 靶标实战新增三类零 token 检测，均在 `core/prefilter.py`：
+### CMS 敏感路径（`CMS_SENSITIVE_PATHS`）
 
-### 1. CMS 敏感路径规则库（`CMS_SENSITIVE_PATHS`）
-
-对抓取到的 URL 路径做纯正则匹配，命中即入库，不消耗 token。已覆盖：
+对抓取到的 URL 路径做正则匹配，命中即入库。已覆盖：
 
 | 类别 | 示例路径 | 严重级别 |
 |------|---------|---------|
@@ -218,59 +208,50 @@ httpx 那样一次性把一批存活 URL 列出来。若你需要"先列存活�
 | 管理入口 | `/phpMyAdmin/`、`/adminer.php`、`/phpinfo.php` | critical / high |
 | 备份文件 | `/backup.sql`、`/db.sql`、`/dump.sql` | critical |
 
-> 新增规则直接往 `CMS_SENSITIVE_PATHS` 列表追加 `(正则, 类型, 严重级别, 说明)` 即可。
+添加规则就往 `CMS_SENSITIVE_PATHS` 追加 `(正则, 类型, 严重级别, 说明)`。
 
-### 2. 源码暴露检测（`detect_source_code_exposure`）
+### 源码暴露（`detect_source_code_exposure`）
 
-当响应体包含 PHP/Python/Ruby 源码特征（`<?php`、`class X extends`、`function`、`namespace`、`import` 等），
-但 Content-Type 不是源码类型（如 `text/plain`、`text/html`）时，判定为源码泄露——典型场景是
-nginx 只对 `.php` 走 PHP-FPM，`.inc`/`.module`/`.theme` 被当静态文件原样返回。
+响应体含 PHP/Python/Ruby 源码特征（`<?php`、`class X extends`、`function`、`namespace`、`import` 等），但 Content-Type 不是源码类型（`text/plain`、`text/html`）时判定源码泄露。典型场景是 nginx 只对 `.php` 走 PHP-FPM，`.inc` / `.module` / `.theme` 被当静态文件原样返回。
 
-误报控制：命中 ≥2 个 PHP 特征才判定 high，单项命中仅 medium。
+为控制误报，命中 2 个以上 PHP 特征才算 high，单项命中只记 medium。
 
-### 3. JSON 配置块哈希泄露（`detect_json_config_secrets`）
+### JSON 配置块哈希泄露（`detect_json_config_secrets`）
 
-扫描内联 `<script type="application/json">`（如 Drupal 的 `drupal-settings-json`）中的安全字段：
-`permissionsHash`、`csrfToken`、`sessionToken`、`nonce` 等命名的 32–128 位十六进制值，
-可能用于会话伪造或权限绕过。同时 `generic_secret` 正则扩展了 `hash_token` 规则。
+扫描内联 `<script type="application/json">`（如 Drupal 的 `drupal-settings-json`）中的安全字段：`permissionsHash`、`csrfToken`、`sessionToken`、`nonce` 等命名的 32-128 位十六进制值，可用于会话伪造或权限绕过。`generic_secret` 正则另有 `hash_token` 规则。
 
-## 新增检测能力（SCRM/企微 实战沉淀，2026-09）
+### 云服务与企业微信凭证（`SECRET_PATTERNS`）
 
-针对企业微信 SCRM / 银行网银前端实战新增以下规则，均在 `core/prefilter.py`：
+| 规则 | 正则特征 | 严重级别 |
+|------|---------|---------|
+| `creative_cloud_appid` | `cc` + 14 位数字 | high |
+| `creative_cloud_secret` | `cc` + 小写字母数字 25-40 位 | critical |
+| `tencent_other_secret` | `AK` + 20 位以上 | critical |
+| `wecom_corpid` | `ww` + 16 位十六进制 | high |
+| `wecom_agentid` | `agentId = 4-10 位数字` | high |
+| `wecom_suite` | `suite_id` / `suite_ticket` / `pre_auth_code` | high |
+| `wechat_appid` | `wx` + 16 位十六进制 | medium |
+| `internal_ip` | RFC1918 内网 IP | medium |
+| `custom_sign_header` | `x-*-signature` 自定义头 | high |
 
-### 4. 国内云服务 & 企业微信凭证（`SECRET_PATTERNS` 扩展）
+`ww` / `wx` 开头的 appid 若没命中，可能是运行时从接口动态获取的，不在静态 JS 里。这是静态审计的边界，需要结合动态测试。
 
-| 规则 | 正则特征 | 严重级别 | 实战样本 |
-|------|---------|---------|---------|
-| `creative_cloud_appid` | `cc` + 14位数字 | high | `cc20210224145031` |
-| `creative_cloud_secret` | `cc` + 小写字母数字25-40位 | critical | `ccjktx6spz7ys26643q9z15urjh183c1` |
-| `tencent_other_secret` | `AK` + 20位以上 | critical | CSII 网银前端 |
-| `wecom_corpid` | `ww` + 16位十六进制 | high | `wwf336afe442d36264` |
-| `wecom_agentid` | `agentId = 4-10位数字` | high | `1000029` |
-| `wecom_suite` | `suite_id/suite_ticket/pre_auth_code` | high | 企业微信服务商模式 |
-| `wechat_appid` | `wx` + 16位十六进制 | medium | 公众号/小程序 |
-| `internal_ip` | RFC1918 内网 IP | medium | CSII 网银 10.x.x.x |
-| `custom_sign_header` | `x-*-signature` 自定义头 | high | `x-header-signature` |
+### 签名机制（`detect_signature_mechanism`）
 
-> 注意：`ww`/`wx` 开头的 appid 若未命中，可能是运行时从 `/public/getScanAuthorizeLogin`
-> 等接口动态获取的（不在静态 JS 中）——这是静态审计的边界，需结合动态测试。
+这是逻辑型发现，不是值型密钥。当 JS 中同时出现自定义签名头（`x-*-signature`）、hash 算法调用（`md5()` / `sha*()`）和 `setRequestHeader()` 注入时，判定签名算法暴露在客户端，可被逆向伪造：
 
-### 5. 签名机制检测（`detect_signature_mechanism`）
-
-**逻辑型发现**（非值型密钥）：当 JS 中同时出现
-「自定义签名头（`x-*-signature`）+ hash 算法调用（`md5()`/`sha*()`）+ `setRequestHeader()` 注入」
-时，判定签名/防篡改算法暴露在客户端，可被逆向伪造。参考样本 `paramsHandler.js`：
 ```javascript
 var signature = md5(str);
 _this.setRequestHeader('x-header-signature', signature.toUpperCase());
 ```
-报告类型：`signature_mechanism`，severity `high`。
 
-### 6. LLM 提示词扩展（`prompts/audit.md`）
+报告类型为 `signature_mechanism`，severity `high`。
 
-- 识别签名机制组合 → 报告 `signature_mechanism`
-- 识别企业微信/腾讯创意云凭证 → 报告 `wecom_credential`
-- 接口含 `isToken: true` 或路径含 `/public/` → 在 note 标注"public 接口，无需认证"
+### LLM 提示词（`prompts/audit.md`）
+
+- 识别签名机制组合，报告 `signature_mechanism`
+- 识别企业微信 / 腾讯创意云凭证，报告 `wecom_credential`
+- 接口含 `isToken: true` 或路径含 `/public/` 时，在 note 标注为免认证接口
 
 ## 输出报告
 
