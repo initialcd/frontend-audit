@@ -164,6 +164,8 @@ class RenderResult:
     """发现的 SPA 路由路径"""
     navigated: bool = False
     error: str = ""
+    blocked_urls: list[str] = field(default_factory=list)
+    """离线模式下被阻断的白名单外请求（外网 CDN / 统计 / 字体等）"""
 
 
 class Renderer:
@@ -302,9 +304,15 @@ class Renderer:
     # ========== 主入口 ==========
 
     async def render_and_collect(
-        self, url: str, max_clicks: int = 30, wait_after_click: float = 1.0
+        self, url: str, max_clicks: int = 30, wait_after_click: float = 1.0,
+        offline: bool = False,
     ) -> RenderResult:
-        """增强渲染入口：CDP 拦截 + JS Hook + 全交互。"""
+        """增强渲染入口：CDP 拦截 + JS Hook + 全交互。
+
+        offline=True（无外网环境，如客户内网云桌面）：把白名单外的请求全部掐断。
+        页面引用的 CDN / 统计 / 字体在无外网时会一直 pending，让 networkidle 干等到
+        超时，渲染慢十倍还经常整页失败；直接 abort 并改用 domcontentloaded 收尾。
+        """
         result = RenderResult()
         if not await self._ensure_browser():
             result.error = "playwright unavailable"
@@ -314,11 +322,31 @@ class Renderer:
         allow_sub = self.cfg.scope.allow_subdomains
         seen_js: set[str] = set()
         js_urls: list[str] = []
+        blocked: list[str] = []
+        # 离线模式配合 domcontentloaded：阻断外链后仍可能有长连接（WebSocket/SSE），
+        # 等 networkidle 会白等到超时。
+        wait_until = "domcontentloaded" if offline else "networkidle"
 
         context = await self._browser.new_context(
             user_agent=self.cfg.scan.user_agent,
             ignore_https_errors=not self.cfg.scan.verify_tls,
         )
+
+        if offline:
+            async def _offline_guard(route):
+                req_url = route.request.url
+                if req_url.startswith(("data:", "blob:", "about:", "javascript:")):
+                    return await route.continue_()
+                try:
+                    if is_in_scope(normalize_url(req_url), domains, allow_sub):
+                        return await route.continue_()
+                except Exception:  # noqa: BLE001
+                    pass
+                blocked.append(req_url)
+                await route.abort()
+
+            await context.route("**/*", _offline_guard)
+
         page = await context.new_page()
 
         # ===== 第一层：CDP 协议层拦截所有请求/响应 =====
@@ -352,10 +380,10 @@ class Renderer:
 
         try:
             # 导航到目标页面
-            await page.goto(url, wait_until="networkidle",
+            await page.goto(url, wait_until=wait_until,
                             timeout=int(self.cfg.scan.timeout * 1000))
             result.navigated = True
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.5 if not offline else 1.0)
 
             # ===== 第二层：注入 JS 运行时 Hook =====
             await self._inject_hooks(page)
@@ -374,7 +402,7 @@ class Renderer:
             # 4. 遍历 SPA 路由
             routes = await self._extract_routes(page)
             result.routes = routes
-            await self._traverse_routes(page, url, routes, domains, allow_sub)
+            await self._traverse_routes(page, url, routes, domains, allow_sub, wait_until)
 
             # 5. 点击所有可交互元素
             await self._click_all(page, max_clicks, wait_after_click)
@@ -385,15 +413,20 @@ class Renderer:
 
             # 去重后汇总
             result.js_urls = list(dict.fromkeys(js_urls))  # 保序去重
+            result.blocked_urls = list(dict.fromkeys(blocked))
 
             logger.info(
                 "增强渲染完成：CDP 拦截 %d 个 JS，Hook 捕获 %d 条，路由 %d 个",
                 len(result.js_urls), len(hook_data), len(routes),
             )
+            if result.blocked_urls:
+                logger.info("离线模式阻断 %d 个白名单外请求（外网 CDN / 统计 / 字体等）",
+                            len(result.blocked_urls))
         except Exception as exc:  # noqa: BLE001
             result.error = repr(exc)
             logger.warning("增强渲染 %s 失败：%s", url, exc)
             result.js_urls = list(dict.fromkeys(js_urls))
+            result.blocked_urls = list(dict.fromkeys(blocked))
         finally:
             try:
                 await context.close()
@@ -572,7 +605,7 @@ class Renderer:
 
     async def _traverse_routes(
         self, page, base_url: str, routes: list[str],
-        domains: list[str], allow_sub: bool
+        domains: list[str], allow_sub: bool, wait_until: str = "networkidle"
     ) -> None:
         """遍历 SPA 路由，每个路由页面触发新的 chunk 加载。"""
         if not routes:
@@ -584,7 +617,7 @@ class Renderer:
                 full_url = urljoin(base, route)
                 if not is_in_scope(normalize_url(full_url), domains, allow_sub):
                     continue
-                await page.goto(full_url, wait_until="networkidle",
+                await page.goto(full_url, wait_until=wait_until,
                                 timeout=int(self.cfg.scan.timeout * 1000))
                 await asyncio.sleep(0.8)
                 if i % 5 == 0:

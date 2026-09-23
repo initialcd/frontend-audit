@@ -58,6 +58,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--render", choices=["off", "hybrid", "full"], default=None,
                    help="增强渲染模式（覆盖 config.yaml）：off=纯 httpx / "
                         "hybrid=仅 SPA 空壳 / full=对所有 HTML 页面启用")
+    p.add_argument("--offline", action="store_true",
+                   help="离线模式：不调 LLM、不连代理、渲染时阻断一切白名单外请求。"
+                        "客户内网 / 云桌面等无外网环境用；结果全部来自本地正则，"
+                        "并额外生成 report.html 供就地查看")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -97,6 +101,22 @@ def purge_state(cfg: Config) -> None:
         print(f"[*] --fresh：已清空历史记录（{'、'.join(removed)}）")
 
 
+def apply_offline(cfg: Config, offline: bool) -> None:
+    """离线模式：把一切外联路径切掉。
+
+    对客户内网 / 云桌面这类"只能进不能出"的环境，工具必须保证不往外发任何请求：
+    - LLM：不发（审计结果全部来自本地正则，发现数量不变，只是少了语义推理那部分）
+    - 代理池：不连
+    - 增强渲染：仍可用（浏览器与 Playwright 都是本地能力），但白名单外请求会被阻断
+    """
+    if not offline:
+        return
+    cfg.scan.offline = True
+    cfg.scan.llm_enabled = False
+    cfg.scan.audit_json = False
+    cfg.proxy.enabled = False
+
+
 def render_state(cfg: Config) -> str:
     """增强渲染的实际可用状态：包/内核缺失都明确讲出来，避免"以为开了"。"""
     if not cfg.scan.render_enabled or cfg.scan.render_mode == "off":
@@ -133,6 +153,7 @@ async def amain(args: argparse.Namespace) -> int:
         cfg.scan.render_enabled = args.render != "off"
     if args.fresh:
         purge_state(cfg)
+    apply_offline(cfg, args.offline)
 
     # 安全约束：无授权白名单则拒绝运行
     if not cfg.scope.domains:
@@ -162,6 +183,8 @@ async def amain(args: argparse.Namespace) -> int:
           f"代理：{'开' if cfg.proxy.enabled else '关'}")
     print(f"[*] 增强渲染：{render_state(cfg)}")
     print(f"[*] 断点续跑：{'关（--fresh）' if args.fresh else '开（命中去重记录会跳过）'}")
+    if cfg.scan.offline:
+        print("[*] 离线模式：不发 LLM、不连代理，渲染阻断白名单外请求；报告就地生成 report.html")
     try:
         summary = await orch.run(seeds)
     finally:
@@ -199,6 +222,7 @@ async def download_mode(args: argparse.Namespace) -> int:
         cfg.scan.render_enabled = args.render != "off"
     if args.fresh:
         purge_state(cfg)
+    apply_offline(cfg, args.offline)
 
     if not cfg.scope.domains:
         print(
@@ -235,6 +259,8 @@ async def download_mode(args: argparse.Namespace) -> int:
     print(f"[*] 节点预算：每域 {cfg.scan.max_nodes_per_domain}，全局 {cfg.scan.max_total_nodes}")
     print(f"[*] 增强渲染：{render_state(cfg)}")
     print(f"[*] 断点续跑：{'关（--fresh）' if args.fresh else '开（命中去重记录会跳过，想全量重跑加 --fresh）'}")
+    if cfg.scan.offline:
+        print("[*] 离线模式：不发 LLM、不连代理，渲染阻断白名单外请求")
 
     try:
         summary = await orch.run(seeds)

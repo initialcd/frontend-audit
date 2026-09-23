@@ -65,6 +65,7 @@ class Summary:
     render_failures: int = 0
     render_js_urls: int = 0
     render_route_count: int = 0
+    render_blocked: int = 0       # 离线模式：被阻断的白名单外请求数
     skipped_scope: int = 0
     skipped_dup: int = 0
     skipped_budget: int = 0
@@ -480,8 +481,13 @@ class Orchestrator:
                     "全量" if render_mode == "full" else "SPA空壳", fr.url)
         self.summary.rendered += 1
         rr = await self.renderer.render_and_collect(
-            fr.final_url, max_clicks=self.cfg.scan.render_max_clicks
+            fr.final_url, max_clicks=self.cfg.scan.render_max_clicks,
+            offline=bool(getattr(self.cfg.scan, "offline", False)),
         )
+        if rr.blocked_urls:
+            self.summary.render_blocked += len(rr.blocked_urls)
+            logger.info("离线模式阻断 %d 个白名单外请求（外网 CDN / 统计 / 字体）",
+                        len(rr.blocked_urls))
         if rr.error and not rr.js_urls:
             self.summary.render_failures += 1
             logger.warning("渲染失败：%s", rr.error)

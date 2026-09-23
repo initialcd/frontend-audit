@@ -32,6 +32,7 @@ class ScanConfig(BaseModel):
     llm_snippet_cap: int = 12000
     llm_enabled: bool = True
     audit_json: bool = False           # 是否对 JSON 内容也送 LLM 审计（默认关，省 token）
+    offline: bool = False              # 离线模式：不调 LLM、不走代理、渲染时阻断白名单外的一切请求
     llm_full_audit: bool = False       # 全量片段送 LLM 开关：对无正则命中但可能有语义漏洞的 JS 也送全文片段
     llm_full_audit_domains: list[str] = Field(
         default_factory=list          # 特定域名白名单：命中这些域名时全量片段送 LLM

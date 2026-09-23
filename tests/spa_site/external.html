@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>SPA Demo · 含外网依赖</title></head>
+<body>
+<div id="app"></div>
+<script src="/static/main.js"></script>
+
+<!-- 故意指向不可路由地址，模拟"客户内网里页面引用外网 CDN/统计"的场景：
+     不阻断时浏览器会一直等这些请求（networkidle 干等到超时），
+     开启离线模式后会被直接 abort。10.255.255.1 属于保留网段，绝不会真的连通。 -->
+<script src="http://10.255.255.1/cdn/jquery.min.js"></script>
+<link rel="stylesheet" href="http://10.255.255.1/cdn/theme.css">
+<img src="http://10.255.255.1/pixel.gif" alt="">
+<script src="https://cdn.jsdelivr.invalid/analytics.js"></script>
+</body>
+</html>

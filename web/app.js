@@ -32,6 +32,23 @@ function updateRenderHint() {
     ? "所有 HTML 页面都会启动浏览器渲染：覆盖最全，最慢"
     : "仅当页面是 SPA 空壳（正文很短 + 有外链脚本）时才渲染";
   hint.style.color = "";
+  if ($("offline").checked) {
+    hint.textContent += "；离线模式已开：渲染会阻断白名单外的全部请求，不会卡在外网 CDN 上";
+  }
+}
+
+// 离线模式联动：勾上就把 LLM / JSON 审计 / 代理一起关掉并锁住
+function applyOfflineUI() {
+  const on = $("offline").checked;
+  if (on) {
+    $("llm").checked = false;
+    $("audit_json").checked = false;
+    $("proxy").checked = false;
+  }
+  $("llm").disabled = on || !llmAvailable;
+  $("proxy").disabled = on;
+  syncAuditJson();
+  updateRenderHint();
 }
 
 // ---------- 初始化 ----------
@@ -46,6 +63,7 @@ async function init() {
     $("audit_json").checked = !!cfg.audit_json;
     $("proxy").checked = cfg.proxy_enabled;
     $("verify_tls").checked = cfg.verify_tls !== false;
+    $("offline").checked = !!cfg.offline;
     $("render_mode").value = cfg.render_mode || "hybrid";
     renderReady = !!cfg.render_ready;
     updateRenderHint();
@@ -62,6 +80,7 @@ async function init() {
     const proxyBadge = $("badge-proxy");
     proxyBadge.textContent = "代理: " + (cfg.proxy_enabled ? "开" : "关");
     proxyBadge.className = "badge " + (cfg.proxy_enabled ? "on" : "off");
+    applyOfflineUI();
     applyMode("download");
   } catch (e) {
     setStatus("加载配置失败：" + e, true);
@@ -122,6 +141,7 @@ document.querySelectorAll(".tab").forEach((t) =>
 // ---------- LLM 开关联动 JSON 审计 ----------
 $("llm").addEventListener("change", syncAuditJson);
 $("render_mode").addEventListener("change", updateRenderHint);
+$("offline").addEventListener("change", applyOfflineUI);
 
 // ---------- 从种子提取域名 ----------
 $("extract-domains").addEventListener("click", () => {
@@ -166,6 +186,7 @@ $("start").addEventListener("click", async () => {
     audit_json: $("audit_json").checked,
     proxy: $("proxy").checked,
     verify_tls: $("verify_tls").checked,
+    offline: $("offline").checked,
     render_mode: $("render_mode").value,
     mode: currentMode,
     out_dir: $("out_dir").value.trim(),

@@ -316,7 +316,13 @@ class ScanManager:
             bool(params.get("llm", True)) and bool(cfg.resolve_api_key())
         ) if not download_only else False
         cfg.scan.audit_json = bool(params.get("audit_json", False)) and not download_only
-        cfg.proxy.enabled = bool(params.get("proxy", False))
+        # 离线模式（客户内网 / 云桌面等"只能进不能出"的环境）：切断一切外联。
+        # LLM 不发、代理不连；渲染仍可用，但白名单外请求会被阻断。
+        cfg.scan.offline = bool(params.get("offline", False))
+        if cfg.scan.offline:
+            cfg.scan.llm_enabled = False
+            cfg.scan.audit_json = False
+        cfg.proxy.enabled = bool(params.get("proxy", False)) and not cfg.scan.offline
         # 渲染：UI 的 render_mode 即总开关（选 off 就是关，选 hybrid/full 就开），
         # 避免 config.yaml 里 render_enabled=false 时"选了模式却不生效"的困惑
         cfg.scan.render_mode = str(params.get("render_mode", cfg.scan.render_mode))
@@ -373,6 +379,9 @@ class ScanManager:
                               ("（对所有 HTML 页面）" if cfg.scan.render_mode == "full" else "（仅 SPA 空壳）"))
         if not cfg.scan.verify_tls:
             state.logs.append("[*] TLS 证书校验：已关闭")
+        if cfg.scan.offline:
+            state.logs.append("[*] 离线模式：不调 LLM、不连代理，渲染阻断白名单外请求；"
+                              "审计结果全部来自本地正则，报告就地生成 report.html")
         # 竞态兜底：取消请求可能落在"线程已起、orch 还没建好"的窗口里，
         # 那时 nobody 能通知 orch；这里补执行，避免取消丢单、任务照跑到底。
         if state.cancel_requested:
@@ -662,6 +671,7 @@ class Handler(BaseHTTPRequestHandler):
             # 避免"选了 hybrid 却什么都没发生"
             "render_ready": renderer.available() and renderer.browser_ready(),
             "verify_tls": cfg.scan.verify_tls,
+            "offline": cfg.scan.offline,
             # 离线可用性：下载模式永远可离线；审计模式在无 Key 时自动降级为纯本地正则
             "network_required": False,
             "offline_ready": True,
