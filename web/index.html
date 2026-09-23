@@ -50,15 +50,15 @@
       </div>
 
       <div class="form-row">
-        <label>授权扫描清单（每行一个 URL）</label>
-        <textarea id="seeds" placeholder="https://target.example.com&#10;https://app.example.com/index.html"></textarea>
-        <div class="hint">只允许 http/https；递归永远出不了下方白名单</div>
+        <label>授权扫描清单（每行一个，可只写 IP / 主机名）</label>
+        <textarea id="seeds" placeholder="192.168.1.10&#10;25.66.174.245:8080&#10;https://app.corp.local/index.html"></textarea>
+        <div class="hint">完整 URL、主机名、IP 都收；没写协议时自动按 http 与 https 各试一次；递归永远出不了下方白名单</div>
       </div>
 
       <div class="form-row">
-        <label>授权域名白名单（逗号 / 中文逗号 / 换行分隔，支持多主域名）</label>
+        <label>授权域名白名单（每行一个，也支持逗号 / 顿号分隔）</label>
         <div class="row2">
-          <input type="text" id="domains" placeholder="example.com,another.org">
+          <textarea id="domains" placeholder="corp.internal&#10;25.66.174.245&#10;example.com"></textarea>
           <button id="extract-domains" class="ghost" type="button">从种子提取</button>
         </div>
         <div class="hint">每个主域名（含子域）独立分组配额互不挤占；自动清洗协议/端口/大小写；未填则拒绝运行（安全约束）</div>

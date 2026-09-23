@@ -56,6 +56,9 @@ textarea { min-height: 150px; resize: vertical; font-family: "Consolas", monospa
 input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+/* 白名单是文本框，允许换行分隔；压缩高度并让按钮顶对齐 */
+.row2 > textarea { min-height: 64px; }
+.row2 > button.ghost { align-self: start; }
 .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .check input { width: auto; }
 

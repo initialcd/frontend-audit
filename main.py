@@ -28,7 +28,7 @@ from core.auditor import Auditor
 from core.config import Config
 from core.dedup import Dedup
 from core.fetcher import Fetcher
-from core.normalizer import parse_domains
+from core.normalizer import expand_seed, parse_domains
 from core.orchestrator import Orchestrator
 from core.proxy_pool import ProxyPool
 from core.renderer import Renderer
@@ -67,18 +67,27 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_seeds(target: str) -> list[str]:
-    if target.startswith(("http://", "https://")):
-        return [target]
+    """读取种子：既接受 URL 清单文件，也接受直接给一个 URL / 主机名 / IP。
+
+    纯主机名或 IP 会自动补协议（未写端口时 http 与 https 各试一条），
+    内网扫描时不用手写 http://。清单文件里同样可以只写 IP，每行一条。
+    """
     path = Path(target)
-    if not path.exists():
-        print(f"错误：找不到文件 {target}", file=sys.stderr)
+    if path.exists() and path.is_file():
+        raw = path.read_text(encoding="utf-8").splitlines()
+    else:
+        raw = [target]
+
+    seeds: list[str] = []
+    for line in raw:
+        seeds.extend(expand_seed(line))
+    seen: set[str] = set()
+    uniq = [s for s in seeds if not (s in seen or seen.add(s))]
+    if not uniq:
+        print(f"错误：{target} 既不是可读文件，也不是合法的 URL / 主机名 / IP",
+              file=sys.stderr)
         sys.exit(2)
-    seeds = [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-    return seeds
+    return uniq
 
 
 def purge_state(cfg: Config) -> None:

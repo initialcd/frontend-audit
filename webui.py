@@ -28,7 +28,7 @@ from core.auditor import Auditor
 from core.config import Config
 from core.dedup import Dedup
 from core.fetcher import Fetcher
-from core.normalizer import parse_domains
+from core.normalizer import expand_seed, is_in_scope, normalize_url, parse_domains
 from core.orchestrator import Orchestrator
 from core.proxy_pool import ProxyPool
 from core.renderer import Renderer
@@ -608,21 +608,53 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_start(self, params: dict) -> None:
         seeds_raw = str(params.get("seeds", ""))
-        seeds = [s.strip() for s in seeds_raw.splitlines()
-                 if s.strip() and not s.strip().startswith("#")]
-        seeds = [s for s in seeds if s.startswith(("http://", "https://"))]
+        # 每行一条：URL、主机名或 IP 都收。没写协议的条目会被展开成 http/https
+        # 两条（内网两种都常见），用户不必猜目标协议。
+        seeds: list[str] = []
+        auto_scheme: list[str] = []
+        for line in seeds_raw.splitlines():
+            urls = expand_seed(line)
+            if not urls:
+                continue
+            if len(urls) > 1:
+                auto_scheme.append(line.strip())
+            seeds.extend(urls)
+        seen: set[str] = set()
+        seeds = [s for s in seeds if not (s in seen or seen.add(s))]
+
         domains = parse_domains(str(params.get("domains", "")))
         mode = "download" if str(params.get("mode", "audit")) == "download" else "audit"
         if not seeds:
-            return self._json({"error": "授权扫描清单为空或无合法 http(s) URL"}, 400)
+            return self._json({
+                "error": "授权扫描清单为空：每行填一个 URL、主机名或 IP 均可"
+                         "（如 192.168.1.10 或 https://app.corp.local）"
+            }, 400)
         if not domains:
             return self._json({"error": "授权域名白名单为空（安全约束，拒绝运行）"}, 400)
+
         params["seeds"] = seeds
         params["domains"] = domains
         params["mode"] = mode
+
+        # 种子落在白名单外会被递归层直接跳过（表现为"任务秒退、0 个节点"），
+        # 这里提前算出来提示用户，而不是让他去日志里猜。
+        allow_sub = MGR.base_cfg.scope.allow_subdomains
+        outside = [s for s in seeds if not is_in_scope(normalize_url(s), domains, allow_sub)]
+
         # force=True：运行中直接抢占（放弃旧任务后开新任务），供"放弃并重开"用
         force = bool(params.get("force"))
         res = MGR.start(params, force=force)
+        if isinstance(res, dict) and "error" not in res:
+            notes: list[str] = []
+            if auto_scheme:
+                notes.append("以下条目未写协议，已按 http 与 https 各试一次："
+                             + "、".join(auto_scheme[:5])
+                             + ("…" if len(auto_scheme) > 5 else ""))
+            if outside:
+                notes.append("以下种子不在白名单内，会被跳过："
+                             + "、".join(outside[:5]) + ("…" if len(outside) > 5 else ""))
+            if notes:
+                res["notice"] = "；".join(notes)
         self._json(res, 200 if "error" not in res else 409)
 
     def _serve_report(self, fmt: str) -> None:

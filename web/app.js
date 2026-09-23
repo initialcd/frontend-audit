@@ -145,23 +145,26 @@ $("offline").addEventListener("change", applyOfflineUI);
 
 // ---------- 从种子提取域名 ----------
 $("extract-domains").addEventListener("click", () => {
-  const lines = $("seeds").value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const lines = $("seeds").value.split(/\r?\n/).map((s) => s.trim()).filter((s) => s && !s.startsWith("#"));
   const hosts = new Set();
   for (const l of lines) {
+    let h = "";
     try {
-      const u = new URL(l);
-      if (u.hostname) hosts.add(u.hostname);
+      // 种子可能只写了 IP 或主机名，补个协议再解析
+      h = new URL(l.includes("://") ? l : "http://" + l).hostname;
     } catch {}
+    if (h) hosts.add(h);
   }
-  if (hosts.size) $("domains").value = [...hosts].join(",");
-  else alert("未能从种子中提取到域名，请检查 URL 格式");
+  if (hosts.size) $("domains").value = [...hosts].join("\n");
+  else alert("未能从种子中提取到域名或 IP，请检查输入");
 });
 
 // ---------- 开始 / 放弃并重开 ----------
 $("start").addEventListener("click", async () => {
   const seeds = $("seeds").value.split(/\r?\n/).map((s) => s.trim()).filter((s) => s && !s.startsWith("#"));
-  const domains = $("domains").value.split(",").map((s) => s.trim()).filter(Boolean);
-  if (!seeds.length) return alert("请填写授权扫描清单（至少一个 URL）");
+  // 白名单与后端一致：逗号 / 中文逗号 / 顿号 / 分号 / 换行 / 空白都算分隔符
+  const domains = $("domains").value.split(/[,，、;；\s]+/).map((s) => s.trim()).filter(Boolean);
+  if (!seeds.length) return alert("请填写授权扫描清单（URL、主机名或 IP 均可）");
   if (!domains.length) return alert("请填写授权域名白名单（安全约束，未填拒绝运行）");
 
   // 运行中点击 = 放弃当前任务，按现在的模式/参数立刻重开（模式选错的主路径）
@@ -206,6 +209,8 @@ $("start").addEventListener("click", async () => {
     currentScanId = res.scan_id || "";
     resetResultViews();
     ensurePolling();
+    // 自动补协议、以及"种子落在白名单外会被跳过"这类信息，后端会一并回传
+    if (res.notice) setTimeout(() => alert(res.notice), 100);
   } catch (e) {
     setStatus("启动失败：" + e, true);
     updateControls(currentStatus);

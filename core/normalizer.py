@@ -51,6 +51,56 @@ def parse_domains(raw) -> list[str]:
     return out
 
 
+def _bracket_ipv6(s: str) -> str:
+    """裸写 IPv6 时补方括号。
+
+    URL 的 authority 里 IPv6 必须用 `[]` 包裹，否则 `2001:db8::1:8080` 这种
+    写法没法区分"最后一段是地址还是端口"，解析会直接失败。
+    """
+    authority, sep, rest = s.partition("/")
+    if authority.startswith("["):
+        return s
+    if authority.count(":") >= 2:
+        authority = f"[{authority}]"
+    return authority + (sep + rest if sep else "")
+
+
+def expand_seed(raw: str) -> list[str]:
+    """把用户输入的一条种子展开成可直接抓取的 URL 列表。
+
+    用户经常只写主机名或 IP（内网扫描的常态），不该强迫他补协议：
+    - 写了 http:// 或 https://：原样一条；
+    - 写了其它协议（ftp:// 等）：丢弃；
+    - 只写主机/IP，端口 443 补 https、80 补 http；
+    - 其它端口或没写端口：http 与 https 各来一条，一次试全，用户不必猜目标协议。
+
+    路径会被完整保留（`host:8080/app/` 这种半截写法同样支持），
+    因为入口路径无法靠猜，而这恰恰是 URL 相对裸域名的唯一不可替代之处。
+    空白行与 `#` 开头的注释行返回空列表。
+    """
+    s = (raw or "").strip()
+    if not s or s.startswith("#"):
+        return []
+    low = s.lower()
+    if low.startswith(("http://", "https://")):
+        return [s]
+    if "://" in s:
+        return []
+    s = s.lstrip("/")          # 兼容 //host/path 这种协议相对写法
+    if not s:
+        return []
+    s = _bracket_ipv6(s)
+    try:
+        port = urlparse("//" + s).port
+    except ValueError:
+        return ["http://" + s]
+    if port == 443:
+        return ["https://" + s]
+    if port == 80:
+        return ["http://" + s]
+    return ["http://" + s, "https://" + s]
+
+
 def normalize_url(url: str) -> str:
     """规范化 URL：scheme/host 小写、去默认端口、去 fragment、
     路径连续斜杠折叠、query 参数排序。"""
